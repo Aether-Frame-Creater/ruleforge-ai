@@ -106,6 +106,10 @@ export interface PipelineResult {
   caseFile: CaseFile;
   stats: {
     llmCalls: number;
+    /** Calls that actually reached the API. Zero in replay mode. */
+    apiCalls: number;
+    replayedCalls: number;
+    fallbackCalls: number;
     promptTokens: number;
     candidateTokens: number;
     thoughtTokens: number;

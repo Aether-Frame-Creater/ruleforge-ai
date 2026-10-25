@@ -11,9 +11,22 @@ const envSchema = z.object({
   BETTER_AUTH_URL: z.string().url(),
   GOOGLE_API_KEY: z.string().min(1),
   /** Main reasoning model: obligation extraction, rule drafting, review. */
-  GEMINI_MODEL: z.string().default("gemini-3.8-flash"),
+  GEMINI_MODEL: z.string().default("gemini-3.5-flash"),
   /** Cheap model for high-volume, low-stakes calls: chunk triage, labelling. */
   GEMINI_MODEL_LITE: z.string().default("gemini-3.5-flash-lite"),
+  /**
+   * Stand-in for the main model when its request quota is exhausted. Optional:
+   * without it, a quota failure stops the run rather than silently degrading
+   * the model that writes and reviews rules.
+   */
+  GEMINI_MODEL_FALLBACK: z.string().optional(),
+  /**
+   * How agent calls reach Gemini:
+   * - `live`   always calls the API and never touches the cache;
+   * - `record` calls the API and saves each response for later replay;
+   * - `replay` serves saved responses only and never calls the API.
+   */
+  LLM_MODE: z.enum(["live", "record", "replay"]).default("record"),
   /**
    * Password for the demo users created by `npm run db:seed`. Optional so the
    * app still boots without it; the seed script fails loudly if it is missing.

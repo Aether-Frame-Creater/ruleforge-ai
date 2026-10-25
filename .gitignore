@@ -45,3 +45,6 @@ next-env.d.ts
 
 # uploaded circular PDFs
 /storage
+
+# recorded model responses for LLM_MODE=replay
+/storage/llm-cache

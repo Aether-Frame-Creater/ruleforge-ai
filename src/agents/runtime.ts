@@ -11,14 +11,25 @@
  * Agents are not allowed to talk to Gemini any other way.
  */
 import { InMemorySessionService, LlmAgent, Runner, isFinalResponse } from "@google/adk";
-import { ThinkingLevel, type Content, type Part } from "@google/genai";
+import { ThinkingLevel, type Part } from "@google/genai";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type { z } from "zod";
 
 import { agentRuns, auditLog } from "@/db/schema";
+import { GEMINI_MODEL_FALLBACK } from "@/lib/ai/gemini";
 import { db } from "@/lib/db";
 
+import {
+  cacheKey,
+  llmMode,
+  readCached,
+  ReplayMissError,
+  writeCached,
+  type CachedGeneration,
+  type HashablePart,
+  type LlmMode,
+} from "./llm-cache";
 import type { A2AEnvelope, AgentName } from "./types";
 
 /* -------------------------------------------------------------------------- */
@@ -122,12 +133,24 @@ export interface CallTiming {
   totalTokens: number;
   /** Set when the step ran concurrently with others. */
   concurrent?: boolean;
+  /** How the response was obtained. */
+  mode?: LlmMode;
+  /** True when the response came from the replay cache, not the API. */
+  fromCache?: boolean;
+  /** The model that actually answered. */
+  model?: string;
 }
 
 /** Per-run state: budget consumption, timings and the envelope log. */
 export class PipelineContext {
   readonly startedAt = Date.now();
   llmCalls = 0;
+  /** Calls that actually reached the API. */
+  apiCalls = 0;
+  /** Calls served from the replay cache. */
+  replayedCalls = 0;
+  /** Calls the quota fallback had to take over. */
+  fallbackCalls = 0;
   promptTokens = 0;
   candidateTokens = 0;
   thoughtTokens = 0;
@@ -177,6 +200,9 @@ export class PipelineContext {
   stats() {
     return {
       llmCalls: this.llmCalls,
+      apiCalls: this.apiCalls,
+      replayedCalls: this.replayedCalls,
+      fallbackCalls: this.fallbackCalls,
       promptTokens: this.promptTokens,
       candidateTokens: this.candidateTokens,
       thoughtTokens: this.thoughtTokens,
@@ -423,7 +449,7 @@ export interface InvokeAgentParams<S extends z.ZodType> {
   ctx: PipelineContext;
   /** Name used in `agent_runs` and in envelopes. */
   name: AgentName;
-  agent: LlmAgent;
+  agent: AgentSpec;
   /** The user-turn parts: text, and for intake the inline PDF. */
   parts: Part[];
   schema: S;
@@ -443,6 +469,28 @@ export interface InvokeAgentParams<S extends z.ZodType> {
   concurrent?: boolean;
 }
 
+/** Reduces prompt parts to the stable shape the cache key hashes. */
+function hashableParts(parts: Part[]): HashablePart[] {
+  return parts.map((part) =>
+    part.inlineData
+      ? {
+          inlineData: {
+            mimeType: part.inlineData.mimeType ?? "application/octet-stream",
+            data: part.inlineData.data ?? "",
+          },
+        }
+      : { text: part.text ?? "" },
+  );
+}
+
+interface Generation {
+  text: string;
+  usage: { prompt: number; candidates: number; thoughts: number; total: number };
+  modelUsed: string;
+  attempts: number;
+  fromCache: boolean;
+}
+
 /**
  * Runs one agent to completion and returns its validated output.
  *
@@ -453,24 +501,34 @@ export interface InvokeAgentParams<S extends z.ZodType> {
 export async function invokeAgent<S extends z.ZodType>(
   params: InvokeAgentParams<S>,
 ): Promise<z.infer<S>> {
-  const { ctx, name, agent, parts, schema, request } = params;
+  const { ctx, name, agent: spec, parts, schema, request } = params;
   ctx.assertBudget(name);
   ctx.record(request);
 
-  const runId = await openRun(ctx.circularId, name, { envelope: request });
-  const startedAt = Date.now();
-
-  const runner = new Runner({
-    appName: "ruleforge",
-    agent,
-    sessionService: new InMemorySessionService(),
-    autoCreateSession: true,
+  const mode = llmMode();
+  const key = cacheKey({
+    kind: "generate",
+    model: spec.model,
+    instruction: spec.instruction,
+    parts: hashableParts(parts),
   });
 
-  const newMessage: Content = { role: "user", parts };
+  const runId = await openRun(ctx.circularId, name, {
+    envelope: request,
+    mode,
+    cache_key: key,
+  });
+  const startedAt = Date.now();
 
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= ctx.budget.maxRetries; attempt += 1) {
+  /** One attempt against the API. Throws; retrying is the caller's business. */
+  async function callOnce(active: AgentSpec): Promise<Generation> {
+    const runner = new Runner({
+      appName: "ruleforge",
+      agent: active.agent,
+      sessionService: new InMemorySessionService(),
+      autoCreateSession: true,
+    });
+
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
@@ -487,32 +545,22 @@ export async function invokeAgent<S extends z.ZodType>(
     });
 
     try {
-      ctx.llmCalls += 1;
       let text = "";
-      const callTokens = {
-        prompt: 0,
-        candidates: 0,
-        thoughts: 0,
-        total: 0,
-      };
+      const usage = { prompt: 0, candidates: 0, thoughts: 0, total: 0 };
 
       const iteration = (async () => {
         for await (const event of runner.runAsync({
           userId: "pipeline",
           sessionId: randomUUID(),
-          newMessage,
+          newMessage: { role: "user", parts },
           abortSignal: controller.signal,
         })) {
           if (event.usageMetadata) {
-            const usage = event.usageMetadata;
-            callTokens.prompt += usage.promptTokenCount ?? 0;
-            callTokens.candidates += usage.candidatesTokenCount ?? 0;
-            callTokens.thoughts += usage.thoughtsTokenCount ?? 0;
-            callTokens.total += usage.totalTokenCount ?? 0;
-            ctx.promptTokens += usage.promptTokenCount ?? 0;
-            ctx.candidateTokens += usage.candidatesTokenCount ?? 0;
-            ctx.thoughtTokens += usage.thoughtsTokenCount ?? 0;
-            ctx.totalTokens += usage.totalTokenCount ?? 0;
+            const u = event.usageMetadata;
+            usage.prompt += u.promptTokenCount ?? 0;
+            usage.candidates += u.candidatesTokenCount ?? 0;
+            usage.thoughts += u.thoughtsTokenCount ?? 0;
+            usage.total += u.totalTokenCount ?? 0;
           }
           if (event.errorCode) {
             throw new Error(
@@ -538,114 +586,195 @@ export async function invokeAgent<S extends z.ZodType>(
         timeout,
       ]);
 
-      if (timedOut) {
-        throw new AgentTimeoutError(name, ctx.budget.perAgentTimeoutMs);
-      }
+      if (timedOut) throw new AgentTimeoutError(name, ctx.budget.perAgentTimeoutMs);
       if (!text.trim()) {
         throw new AgentOutputError(name, "model returned an empty response");
       }
 
-      const parsed = schema.safeParse(parseJsonResponse(name, text));
-      if (!parsed.success) {
-        throw new AgentOutputError(
-          name,
-          parsed.error.issues
-            .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
-            .join("; "),
-        );
-      }
-
-      const responseType =
-        typeof params.responseType === "function"
-          ? params.responseType(parsed.data)
-          : (params.responseType ?? "result");
-
-      const response = ctx.record(
-        envelope(name, "orchestrator", responseType, parsed.data),
-      );
-
-      const durationMs = Date.now() - startedAt;
-      const timing: CallTiming = {
-        agent: name,
-        kind: "llm",
-        ms: durationMs,
-        attempts: attempt,
-        retries: attempt - 1,
-        thoughtTokens: callTokens.thoughts,
-        promptTokens: callTokens.prompt,
-        candidateTokens: callTokens.candidates,
-        totalTokens: callTokens.total,
-        concurrent: params.concurrent,
+      return {
+        text,
+        usage,
+        modelUsed: active.model,
+        attempts: 1,
+        fromCache: false,
       };
-      ctx.recordTiming(timing);
-
-      await closeRun(runId, "succeeded", {
-        envelope: response,
-        // Everything needed to see where a run spent its time, per call.
-        timing: {
-          duration_ms: durationMs,
-          attempts: attempt,
-          retries: attempt - 1,
-          concurrent: params.concurrent ?? false,
-        },
-        tokens: {
-          prompt: callTokens.prompt,
-          candidates: callTokens.candidates,
-          thoughts: callTokens.thoughts,
-          total: callTokens.total,
-        },
-        model: agent.model ?? null,
-      });
-      return parsed.data;
-    } catch (error) {
-      lastError = error;
-      const kind = classifyFailure(error);
-
-      // A day-scale quota is not a transient failure. Backing off four times to
-      // rediscover that wastes the run and buries the real cause.
-      if (kind === "quota-exhausted") {
-        const detail = errorMessage(error)
-          .replace(/\s+/g, " ")
-          .match(/please retry in [^.\\"]+/i)?.[0];
-        lastError = new QuotaExhaustedError(
-          name,
-          detail ?? "See https://ai.google.dev/gemini-api/docs/rate-limits.",
-        );
-        break;
-      }
-
-      // Schema failures and budget breaches are not transient; only the
-      // network-shaped failures get another attempt.
-      const retryable =
-        (kind === "rate-limited" || kind === "unavailable") &&
-        attempt < ctx.budget.maxRetries;
-      if (!retryable) break;
-
-      if (kind === "rate-limited") ctx.retryCounts.rateLimited += 1;
-      else ctx.retryCounts.unavailable += 1;
-
-      const backoffMs = Math.min(1_000 * 2 ** (attempt - 1), 8_000);
-      const jitter = Math.floor(Math.random() * 250);
-      await sleep(backoffMs + jitter);
     } finally {
       clearTimeout(timer);
     }
   }
 
-  ctx.recordTiming({
-    agent: name,
-    kind: "llm",
-    ms: Date.now() - startedAt,
-    attempts: ctx.budget.maxRetries,
-    retries: ctx.totalRetries,
-    thoughtTokens: 0,
-    promptTokens: 0,
-    candidateTokens: 0,
-    totalTokens: 0,
-    concurrent: params.concurrent,
-  });
-  await closeRun(runId, "failed", null, errorMessage(lastError));
-  throw lastError instanceof Error ? lastError : new Error(errorMessage(lastError));
+  /** Produces the response text, from the cache or the API as the mode allows. */
+  async function produce(): Promise<Generation> {
+    if (mode === "replay") {
+      const cached = await readCached<CachedGeneration>(key);
+      if (!cached) throw new ReplayMissError(name, key);
+      ctx.replayedCalls += 1;
+      return {
+        text: cached.text,
+        usage: cached.usage,
+        modelUsed: cached.modelUsed,
+        attempts: 1,
+        fromCache: true,
+      };
+    }
+
+    let active = spec;
+    let usedFallback = false;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= ctx.budget.maxRetries; attempt += 1) {
+      try {
+        ctx.apiCalls += 1;
+        const result = await callOnce(active);
+        return { ...result, attempts: attempt };
+      } catch (error) {
+        lastError = error;
+        const kind = classifyFailure(error);
+
+        if (kind === "quota-exhausted") {
+          const detail = errorMessage(error)
+            .replace(/\s+/g, " ")
+            .match(/please retry in [^.\\"]+/i)?.[0];
+
+          // One shot at the stand-in model before giving up. Only once: if the
+          // fallback is also exhausted there is nothing left to try, and the
+          // run should stop rather than quietly keep degrading.
+          if (GEMINI_MODEL_FALLBACK && !usedFallback && active.model !== GEMINI_MODEL_FALLBACK) {
+            usedFallback = true;
+            active = spec.withModel(GEMINI_MODEL_FALLBACK);
+            ctx.fallbackCalls += 1;
+            console.warn(
+              `  ! ${name}: ${active.model} standing in for ${spec.model} (quota exhausted)`,
+            );
+            continue;
+          }
+
+          throw new QuotaExhaustedError(
+            name,
+            detail ?? "See https://ai.google.dev/gemini-api/docs/rate-limits.",
+          );
+        }
+
+        // Schema failures and budget breaches are not transient; only the
+        // network-shaped failures get another attempt.
+        const retryable =
+          (kind === "rate-limited" || kind === "unavailable") &&
+          attempt < ctx.budget.maxRetries;
+        if (!retryable) throw error;
+
+        if (kind === "rate-limited") ctx.retryCounts.rateLimited += 1;
+        else ctx.retryCounts.unavailable += 1;
+
+        const backoffMs = Math.min(1_000 * 2 ** (attempt - 1), 8_000);
+        await sleep(backoffMs + Math.floor(Math.random() * 250));
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(errorMessage(lastError));
+  }
+
+  try {
+    ctx.llmCalls += 1;
+    const generation = await produce();
+
+    ctx.promptTokens += generation.usage.prompt;
+    ctx.candidateTokens += generation.usage.candidates;
+    ctx.thoughtTokens += generation.usage.thoughts;
+    ctx.totalTokens += generation.usage.total;
+
+    const parsed = schema.safeParse(parseJsonResponse(name, generation.text));
+    if (!parsed.success) {
+      throw new AgentOutputError(
+        name,
+        parsed.error.issues
+          .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+          .join("; "),
+      );
+    }
+
+    if (mode === "record" && !generation.fromCache) {
+      const entry: CachedGeneration = {
+        kind: "generate",
+        model: spec.model,
+        modelUsed: generation.modelUsed,
+        agent: name,
+        text: generation.text,
+        usage: generation.usage,
+        recordedAt: new Date().toISOString(),
+      };
+      await writeCached(key, entry);
+    }
+
+    const responseType =
+      typeof params.responseType === "function"
+        ? params.responseType(parsed.data)
+        : (params.responseType ?? "result");
+
+    const response = ctx.record(
+      envelope(name, "orchestrator", responseType, parsed.data),
+    );
+
+    const durationMs = Date.now() - startedAt;
+    ctx.recordTiming({
+      agent: name,
+      kind: "llm",
+      ms: durationMs,
+      attempts: generation.attempts,
+      retries: generation.attempts - 1,
+      thoughtTokens: generation.usage.thoughts,
+      promptTokens: generation.usage.prompt,
+      candidateTokens: generation.usage.candidates,
+      totalTokens: generation.usage.total,
+      concurrent: params.concurrent,
+      mode,
+      fromCache: generation.fromCache,
+      model: generation.modelUsed,
+    });
+
+    await closeRun(runId, "succeeded", {
+      envelope: response,
+      mode,
+      from_cache: generation.fromCache,
+      // Everything needed to see where a run spent its time, per call.
+      timing: {
+        duration_ms: durationMs,
+        attempts: generation.attempts,
+        retries: generation.attempts - 1,
+        concurrent: params.concurrent ?? false,
+      },
+      tokens: {
+        prompt: generation.usage.prompt,
+        candidates: generation.usage.candidates,
+        thoughts: generation.usage.thoughts,
+        total: generation.usage.total,
+      },
+      model_requested: spec.model,
+      model: generation.modelUsed,
+      used_fallback: generation.modelUsed !== spec.model,
+    });
+
+    return parsed.data;
+  } catch (error) {
+    ctx.recordTiming({
+      agent: name,
+      kind: "llm",
+      ms: Date.now() - startedAt,
+      attempts: 0,
+      retries: 0,
+      thoughtTokens: 0,
+      promptTokens: 0,
+      candidateTokens: 0,
+      totalTokens: 0,
+      concurrent: params.concurrent,
+      mode,
+      fromCache: false,
+      model: spec.model,
+    });
+    await closeRun(runId, "failed", { mode }, errorMessage(error));
+    throw error;
+  }
 }
 
 /**
@@ -663,8 +792,7 @@ const THINKING_LEVELS: Record<ThinkingSetting, ThinkingLevel> = {
   low: ThinkingLevel.LOW,
 };
 
-/** Builds an agent with the security preamble already attached. */
-export function defineAgent(params: {
+export interface DefineAgentParams {
   name: string;
   model: string;
   description: string;
@@ -673,22 +801,51 @@ export function defineAgent(params: {
   /** Required: no agent gets to inherit the model's default thinking budget. */
   thinking: ThinkingSetting;
   temperature?: number;
-}): LlmAgent {
-  return new LlmAgent({
+}
+
+/**
+ * An agent plus the inputs it was built from.
+ *
+ * The parts are kept because two things need them: the cache key hashes the
+ * full instruction, and the quota fallback has to rebuild the same agent
+ * against a different model.
+ */
+export interface AgentSpec {
+  readonly name: string;
+  readonly model: string;
+  /** The instruction as the model sees it, security preamble included. */
+  readonly instruction: string;
+  readonly agent: LlmAgent;
+  withModel(model: string): AgentSpec;
+}
+
+/** Builds an agent with the security preamble already attached. */
+export function defineAgent(params: DefineAgentParams): AgentSpec {
+  const instruction = `${params.instruction}\n\n${SECURITY_PREAMBLE}`;
+
+  const build = (model: string): AgentSpec => ({
     name: params.name,
-    description: params.description,
-    model: params.model,
-    instruction: `${params.instruction}\n\n${SECURITY_PREAMBLE}`,
-    outputSchema: params.outputSchema as never,
-    generateContentConfig: {
-      temperature: params.temperature ?? 0,
-      thinkingConfig: {
-        thinkingLevel: THINKING_LEVELS[params.thinking],
-        includeThoughts: false,
+    model,
+    instruction,
+    agent: new LlmAgent({
+      name: params.name,
+      description: params.description,
+      model,
+      instruction,
+      outputSchema: params.outputSchema as never,
+      generateContentConfig: {
+        temperature: params.temperature ?? 0,
+        thinkingConfig: {
+          thinkingLevel: THINKING_LEVELS[params.thinking],
+          includeThoughts: false,
+        },
       },
-    },
-    // These agents are leaves driven by the orchestrator, never a tree.
-    disallowTransferToParent: true,
-    disallowTransferToPeers: true,
+      // These agents are leaves driven by the orchestrator, never a tree.
+      disallowTransferToParent: true,
+      disallowTransferToPeers: true,
+    }),
+    withModel: (next: string) => build(next),
   });
+
+  return build(params.model);
 }

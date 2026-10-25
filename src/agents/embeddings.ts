@@ -19,6 +19,14 @@ import {
 } from "@/lib/ai/gemini";
 import { db } from "@/lib/db";
 
+import {
+  cacheKey,
+  llmMode,
+  readCached,
+  ReplayMissError,
+  writeCached,
+  type CachedEmbeddings,
+} from "./llm-cache";
 import { isRetryable } from "./runtime";
 import type { IntakeParagraph } from "./intake-agent";
 import type { StoredChunk } from "./types";
@@ -41,6 +49,22 @@ async function embedBatch(
   client: GoogleGenAI,
   texts: string[],
 ): Promise<Array<number[] | null>> {
+  // Embeddings are API calls too, so they obey LLM_MODE as well: a replay run
+  // that still reached out to the embedding endpoint would not be a replay.
+  const mode = llmMode();
+  const key = cacheKey({
+    kind: "embed",
+    model: EMBEDDING_MODEL,
+    instruction: `dimensions=${EMBEDDING_DIMENSIONS}`,
+    parts: texts.map((text) => ({ text })),
+  });
+
+  if (mode === "replay") {
+    const cached = await readCached<CachedEmbeddings>(key);
+    if (!cached) throw new ReplayMissError("embeddings", key);
+    return cached.embeddings;
+  }
+
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= MAX_EMBED_ATTEMPTS; attempt += 1) {
@@ -54,10 +78,23 @@ async function embedBatch(
         },
       });
 
-      return texts.map((_, index) => {
+      const embeddings = texts.map((_, index) => {
         const values = response.embeddings?.[index]?.values;
         return values && values.length === EMBEDDING_DIMENSIONS ? values : null;
       });
+
+      if (mode === "record") {
+        const entry: CachedEmbeddings = {
+          kind: "embed",
+          model: EMBEDDING_MODEL,
+          dimensions: EMBEDDING_DIMENSIONS,
+          embeddings,
+          recordedAt: new Date().toISOString(),
+        };
+        await writeCached(key, entry);
+      }
+
+      return embeddings;
     } catch (error) {
       lastError = error;
       if (!isRetryable(error) || attempt === MAX_EMBED_ATTEMPTS) break;

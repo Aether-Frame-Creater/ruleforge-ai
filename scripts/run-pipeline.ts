@@ -15,8 +15,10 @@ import { randomUUID } from "node:crypto";
 import { LogLevel, setLogLevel } from "@google/adk";
 import { eq } from "drizzle-orm";
 
+import { llmMode, CACHE_DIR } from "@/agents/llm-cache";
 import { runCircularPipeline } from "@/agents/orchestrator";
 import { audit } from "@/agents/runtime";
+import { GEMINI_MODEL, GEMINI_MODEL_FALLBACK, GEMINI_MODEL_LITE } from "@/lib/ai/gemini";
 import { circulars, user } from "@/db/schema";
 import { db } from "@/lib/db";
 
@@ -31,6 +33,12 @@ function section(title: string) {
   console.log(`\n--- ${title} ${"-".repeat(Math.max(0, 66 - title.length))}`);
 }
 
+const MODE_NOTES: Record<ReturnType<typeof llmMode>, string> = {
+  live: "  (always calls the API; cache not read or written)",
+  record: `  (calls the API, saving responses to ${CACHE_DIR})`,
+  replay: "  (serves saved responses only; no API calls)",
+};
+
 function money(value: number): string {
   return value.toLocaleString("en-US");
 }
@@ -41,6 +49,7 @@ async function main() {
 
   // No silent default: running the pipeline costs model calls and writes a
   // circular, so it must be obvious which document is being processed.
+  const mode = llmMode();
   const source = process.argv[2];
   if (!source) {
     console.error("usage: npm run agents:run -- <path-to-circular.pdf>\n");
@@ -107,6 +116,12 @@ async function main() {
   console.log(`  stored as:   ${storedPath}`);
   console.log(`  circular id: ${circular.id}`);
   console.log(`  uploaded by: ${uploader.email}`);
+  console.log(`  LLM_MODE:    ${mode}${MODE_NOTES[mode]}`);
+  console.log(`  main model:  ${GEMINI_MODEL}`);
+  console.log(`  lite model:  ${GEMINI_MODEL_LITE}`);
+  console.log(
+    `  fallback:    ${GEMINI_MODEL_FALLBACK ?? "(none — a quota failure stops the run)"}`,
+  );
 
   section("pipeline");
   const result = await runCircularPipeline(circular.id, {
@@ -238,18 +253,22 @@ async function main() {
 
   section("timing per call");
   console.log(
-    "  agent                 kind   seconds  retries  thinking  tokens  concurrent",
+    "  agent                 kind   seconds  retries  thinking  tokens  conc  src     model",
   );
   for (const call of result.timings) {
-    console.log(
-      `  ${call.agent.padEnd(20)}  ${call.kind.padEnd(5)}  ${(call.ms / 1000)
-        .toFixed(1)
-        .padStart(7)}  ${String(call.retries).padStart(7)}  ${String(
-        call.thoughtTokens,
-      ).padStart(8)}  ${String(call.totalTokens).padStart(6)}  ${
-        call.concurrent ? "yes" : "no"
-      }`,
-    );
+    const source = call.fromCache ? "cache" : call.kind === "tool" ? "-" : "api";
+    const columns = [
+      call.agent.padEnd(20),
+      call.kind.padEnd(5),
+      (call.ms / 1000).toFixed(1).padStart(7),
+      String(call.retries).padStart(7),
+      String(call.thoughtTokens).padStart(8),
+      String(call.totalTokens).padStart(6),
+      (call.concurrent ? "yes" : "no").padEnd(4),
+      source.padEnd(6),
+      call.model ?? "-",
+    ];
+    console.log(`  ${columns.join("  ")}`);
   }
   const summed = result.timings.reduce((total, call) => total + call.ms, 0);
   console.log(
@@ -258,7 +277,11 @@ async function main() {
   );
 
   section("usage");
-  console.log(`  LLM calls:        ${result.stats.llmCalls}`);
+  console.log(`  mode:             ${mode}`);
+  console.log(`  agent calls:      ${result.stats.llmCalls}`);
+  console.log(`  API calls:        ${result.stats.apiCalls}`);
+  console.log(`  replayed:         ${result.stats.replayedCalls}`);
+  console.log(`  fallback used:    ${result.stats.fallbackCalls}`);
   console.log(`  prompt tokens:    ${money(result.stats.promptTokens)}`);
   console.log(`  candidate tokens: ${money(result.stats.candidateTokens)}`);
   console.log(`  thinking tokens:  ${money(result.stats.thoughtTokens)}`);
