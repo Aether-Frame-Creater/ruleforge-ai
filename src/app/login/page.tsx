@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { LoginForm } from "@/components/app/login-form";
 import { ThemeToggle } from "@/components/app/theme-toggle";
 import { USER_ROLES, type UserRole } from "@/lib/auth";
-import { currentUser, ROLE_DESCRIPTIONS, ROLE_LABELS } from "@/lib/auth/guards";
+import { optionalUser, ROLE_DESCRIPTIONS, ROLE_LABELS } from "@/lib/auth/guards";
 import { env } from "@/lib/env";
 
 /**
@@ -17,7 +17,7 @@ export const metadata = { title: "Sign in — RuleForge AI" };
 export default async function LoginPage({
   searchParams,
 }: PageProps<"/login">) {
-  const user = await currentUser();
+  const user = await optionalUser();
   const params = await searchParams;
   const next = typeof params.next === "string" ? params.next : "/dashboard";
 

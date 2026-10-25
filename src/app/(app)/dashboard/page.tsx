@@ -1,6 +1,8 @@
 import {
   ClipboardCheck,
   FileText,
+  Rocket,
+  RotateCcw,
   ScrollText,
   Scale,
 } from "lucide-react";
@@ -18,7 +20,7 @@ import {
 } from "@/components/ui/card";
 import { requireUser } from "@/lib/auth/guards";
 import { can } from "@/lib/auth/guards";
-import { dashboardSummary } from "@/lib/queries";
+import { dashboardSummary, deploymentCounts } from "@/lib/queries";
 
 export const instant = false;
 
@@ -36,7 +38,10 @@ function timeAgo(date: Date): string {
 
 export default async function DashboardPage() {
   const user = await requireUser("/dashboard");
-  const summary = await dashboardSummary();
+  const [summary, deployment] = await Promise.all([
+    dashboardSummary(),
+    deploymentCounts(),
+  ]);
 
   const stats = [
     {
@@ -64,6 +69,23 @@ export default async function DashboardPage() {
       href: "/rules",
     },
     {
+      label: "Rules in shadow",
+      value: deployment.inShadow,
+      hint:
+        deployment.inShadow > 0
+          ? "Observed, raising no alerts"
+          : "Nothing being observed",
+      icon: Rocket,
+      href: "/rollout",
+    },
+    {
+      label: "Rolled back",
+      value: deployment.rolledBack,
+      hint: deployment.rolledBack > 0 ? "Needs a look" : "None",
+      icon: RotateCcw,
+      href: "/rules",
+    },
+    {
       label: "Open drafts",
       value: summary.openDrafts,
       hint: "Not yet submitted",
@@ -86,7 +108,7 @@ export default async function DashboardPage() {
         }
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         {stats.map((stat) => (
           <Link key={stat.label} href={stat.href} className="group">
             <Card className="h-full transition-colors group-hover:border-foreground/20">

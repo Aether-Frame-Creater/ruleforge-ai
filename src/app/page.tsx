@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 
-import { currentUser } from "@/lib/auth/guards";
+import { optionalUser } from "@/lib/auth/guards";
 
 /**
  * Per-user and always current: this route reads the session and live database
@@ -9,6 +9,6 @@ import { currentUser } from "@/lib/auth/guards";
 export const instant = false;
 
 export default async function RootPage() {
-  const user = await currentUser();
+  const user = await optionalUser();
   redirect(user ? "/dashboard" : "/login");
 }

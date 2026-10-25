@@ -88,6 +88,8 @@ export const ruleVersionStatusEnum = pgEnum("rule_version_status", [
   "approved",
   "shadow",
   "live",
+  // A live version that a newer one replaced. Rollback restores the latest one.
+  "retired",
   "rolled_back",
   "rejected",
 ]);
@@ -238,6 +240,16 @@ export const ruleVersions = pgTable(
       onDelete: "set null",
     }),
     submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    /**
+     * Share of customers on this version while it is in shadow, in stages
+     * (10, 50, then 100 at which point it goes live). Zero means no customer
+     * is on it yet.
+     */
+    rolloutPercent: integer("rollout_percent").notNull().default(0),
+    shadowStartedAt: timestamp("shadow_started_at", { withTimezone: true }),
+    liveAt: timestamp("live_at", { withTimezone: true }),
+    rolledBackAt: timestamp("rolled_back_at", { withTimezone: true }),
+    rollbackReason: text("rollback_reason"),
     changeSummary: text("change_summary"),
     /** Which agent drafted it, e.g. "rule_drafter". */
     createdByAgent: text("created_by_agent"),
@@ -251,6 +263,10 @@ export const ruleVersions = pgTable(
     uniqueIndex("rule_versions_rule_id_version_idx").on(
       table.ruleId,
       table.version,
+    ),
+    check(
+      "rule_versions_rollout_percent_range",
+      sql`${table.rolloutPercent} BETWEEN 0 AND 100`,
     ),
   ],
 );
@@ -295,6 +311,41 @@ export const backtestRuns = pgTable("backtest_runs", {
   customersAffected: integer("customers_affected").notNull().default(0),
   /** Full result payload: per-transaction diffs, histograms, samples. */
   resultJson: jsonb("result_json"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+/**
+ * A side-by-side comparison of the live rule and a shadow rule.
+ *
+ * The shadow rule is only ever *evaluated* here; it raises no alert for any
+ * customer. These rows are the evidence an operator reads before widening a
+ * rollout.
+ */
+export const shadowRuns = pgTable("shadow_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ruleVersionId: uuid("rule_version_id")
+    .notNull()
+    .references(() => ruleVersions.id),
+  /** The live version compared against. Null if no rule was live. */
+  baselineVersionId: uuid("baseline_version_id").references(
+    () => ruleVersions.id,
+  ),
+  txnsEvaluated: integer("txns_evaluated").notNull().default(0),
+  liveAlerts: integer("live_alerts").notNull().default(0),
+  shadowAlerts: integer("shadow_alerts").notNull().default(0),
+  alertsOnlyLive: integer("alerts_only_live").notNull().default(0),
+  alertsOnlyShadow: integer("alerts_only_shadow").notNull().default(0),
+  /** Null when the live rule raised nothing, so a percentage is undefined. */
+  alertRateChangePct: numeric("alert_rate_change_pct", {
+    precision: 10,
+    scale: 2,
+  }),
+  resultJson: jsonb("result_json"),
+  createdBy: text("created_by").references(() => user.id, {
+    onDelete: "set null",
+  }),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -456,8 +507,26 @@ export const ruleVersionsRelations = relations(
       relationName: "backtestBaseline",
     }),
     approvals: many(approvals),
+    shadowRuns: many(shadowRuns, { relationName: "shadowCandidate" }),
   }),
 );
+
+export const shadowRunsRelations = relations(shadowRuns, ({ one }) => ({
+  ruleVersion: one(ruleVersions, {
+    fields: [shadowRuns.ruleVersionId],
+    references: [ruleVersions.id],
+    relationName: "shadowCandidate",
+  }),
+  baselineVersion: one(ruleVersions, {
+    fields: [shadowRuns.baselineVersionId],
+    references: [ruleVersions.id],
+    relationName: "shadowBaseline",
+  }),
+  creator: one(user, {
+    fields: [shadowRuns.createdBy],
+    references: [user.id],
+  }),
+}));
 
 export const backtestRunsRelations = relations(backtestRuns, ({ one }) => ({
   ruleVersion: one(ruleVersions, {
@@ -520,6 +589,9 @@ export type NewTransaction = typeof transactions.$inferInsert;
 
 export type BacktestRun = typeof backtestRuns.$inferSelect;
 export type NewBacktestRun = typeof backtestRuns.$inferInsert;
+
+export type ShadowRun = typeof shadowRuns.$inferSelect;
+export type NewShadowRun = typeof shadowRuns.$inferInsert;
 
 export type Approval = typeof approvals.$inferSelect;
 export type NewApproval = typeof approvals.$inferInsert;

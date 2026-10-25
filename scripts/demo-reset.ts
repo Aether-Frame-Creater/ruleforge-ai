@@ -3,9 +3,15 @@
  *
  *   npm run demo:reset -- --yes
  *
- * Deletes every circular — cascading to its chunks and agent runs — removes the
- * draft and rejected rule versions the pipeline produced along with their
- * backtest runs, and puts the five seeded rules back on their live v1.
+ * Deletes every circular — cascading to its chunks and agent runs — removes
+ * every rule version except each seeded rule's v1, along with the approvals,
+ * backtest runs and shadow runs that reference them, and puts the five seeded
+ * rules back on a live v1.
+ *
+ * "Every version except v1" deliberately includes live, shadow, retired and
+ * rolled_back ones: after a rollout demo the seeded rule's v1 is retired and a
+ * v2 is live, and a reset that spared live versions would leave the next demo
+ * starting from the wrong place.
  *
  * Deliberately left alone:
  * - `user` and `transactions`, so the demo does not have to be re-seeded;
@@ -16,7 +22,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { PgTable } from "drizzle-orm/pg-core";
 
 import {
@@ -29,6 +35,7 @@ import {
   obligations,
   rules,
   ruleVersions,
+  shadowRuns,
 } from "@/db/schema";
 import { db } from "@/lib/db";
 
@@ -39,7 +46,8 @@ async function confirm(): Promise<boolean> {
   const rl = createInterface({ input: stdin, output: stdout });
   try {
     const answer = await rl.question(
-      "This deletes all circulars, draft rule versions and their backtests.\n" +
+      "This deletes all circulars, every rule version except the seeded v1s,\n" +
+        "and their approvals, backtests and shadow runs.\n" +
         "Users, transactions and audit_log are left untouched.\n" +
         "Type 'reset' to continue: ",
     );
@@ -64,43 +72,75 @@ async function main() {
     agentRuns: await count(agentRuns),
     ruleVersions: await count(ruleVersions),
     backtestRuns: await count(backtestRuns),
+    shadowRuns: await count(shadowRuns),
+    approvals: await count(approvals),
   };
 
-  /* -- 1. rule versions the pipeline produced ----------------------------- */
+  /* -- 1. the versions to remove ----------------------------------------- */
 
-  // Anything not live: drafts the agents wrote, and anything a human rejected.
-  // Their backtest runs and approvals go first — both reference the version.
-  const disposable = await db
-    .select({ id: ruleVersions.id })
-    .from(ruleVersions)
-    .where(ne(ruleVersions.status, "live"));
-  const disposableIds = disposable.map((row) => row.id);
+  // Everything except each seeded rule's v1. Keyed on (rule, version) rather
+  // than on status: a rollout demo leaves a v2 live and v1 retired, and the
+  // reset has to undo exactly that.
+  const seededRules = await db
+    .select({ id: rules.id, code: rules.code })
+    .from(rules);
+  const seededIds = new Set(
+    seededRules.filter((r) => SEEDED_RULE_CODES.includes(r.code)).map((r) => r.id),
+  );
+
+  const allVersions = await db
+    .select({
+      id: ruleVersions.id,
+      ruleId: ruleVersions.ruleId,
+      version: ruleVersions.version,
+    })
+    .from(ruleVersions);
+
+  const keepIds = new Set(
+    allVersions
+      .filter((v) => seededIds.has(v.ruleId) && v.version === 1)
+      .map((v) => v.id),
+  );
+  const disposableIds = allVersions
+    .filter((v) => !keepIds.has(v.id))
+    .map((v) => v.id);
+
+  /* -- 2. rows that reference them ---------------------------------------- */
 
   let deletedBacktests = 0;
-  let deletedApprovals = 0;
+  let deletedShadowRuns = 0;
+
+  // Approvals are removed wholesale: every approval belongs to a version that
+  // is about to go, and the demo always starts with nothing approved.
+  const deletedApprovals = (
+    await db.delete(approvals).returning({ id: approvals.id })
+  ).length;
+
   if (disposableIds.length > 0) {
-    // `backtest_runs` also points at a baseline version, so clear both sides.
+    deletedShadowRuns = (
+      await db
+        .delete(shadowRuns)
+        .where(inArray(shadowRuns.ruleVersionId, disposableIds))
+        .returning({ id: shadowRuns.id })
+    ).length;
+    await db
+      .update(shadowRuns)
+      .set({ baselineVersionId: null })
+      .where(inArray(shadowRuns.baselineVersionId, disposableIds));
+
     deletedBacktests = (
       await db
         .delete(backtestRuns)
         .where(inArray(backtestRuns.ruleVersionId, disposableIds))
         .returning({ id: backtestRuns.id })
     ).length;
-
     await db
       .update(backtestRuns)
       .set({ baselineVersionId: null })
       .where(inArray(backtestRuns.baselineVersionId, disposableIds));
-
-    deletedApprovals = (
-      await db
-        .delete(approvals)
-        .where(inArray(approvals.ruleVersionId, disposableIds))
-        .returning({ id: approvals.id })
-    ).length;
   }
 
-  /* -- 2. circulars, cascading ------------------------------------------- */
+  /* -- 3. circulars, cascading -------------------------------------------- */
 
   // `circular_chunks` and `agent_runs` cascade; `obligations` and the rule
   // versions that cite them do not, so they are cleared explicitly first.
@@ -112,7 +152,8 @@ async function main() {
     await db.delete(circulars).returning({ id: circulars.id })
   ).length;
 
-  /* -- 3. drop the non-live versions and any rule the demo invented ------- */
+  // A rule cannot point at a version that is about to be deleted.
+  await db.update(rules).set({ currentVersionId: null });
 
   const deletedVersions =
     disposableIds.length > 0
@@ -125,15 +166,15 @@ async function main() {
       : 0;
 
   // Rules the pipeline invented (R-106 and up) have no version left at all.
-  // Worked out in TypeScript rather than a hand-built SQL fragment: the set is
-  // tiny and the intent is obvious here.
-  const allRules = await db.select({ id: rules.id, code: rules.code }).from(rules);
+  const allRulesNow = await db
+    .select({ id: rules.id, code: rules.code })
+    .from(rules);
   const ruleIdsWithVersions = new Set(
     (await db.select({ ruleId: ruleVersions.ruleId }).from(ruleVersions)).map(
       (row) => row.ruleId,
     ),
   );
-  const orphanRules = allRules.filter(
+  const orphanRules = allRulesNow.filter(
     (rule) =>
       !SEEDED_RULE_CODES.includes(rule.code) &&
       !ruleIdsWithVersions.has(rule.id),
@@ -167,7 +208,16 @@ async function main() {
 
     await db
       .update(ruleVersions)
-      .set({ status: "live" })
+      .set({
+        status: "live",
+        rolloutPercent: 100,
+        shadowStartedAt: null,
+        liveAt: null,
+        rolledBackAt: null,
+        rollbackReason: null,
+        submittedBy: null,
+        submittedAt: null,
+      })
       .where(eq(ruleVersions.id, v1.id));
     await db
       .update(rules)
@@ -189,6 +239,7 @@ async function main() {
         obligations: deletedObligations,
         rule_versions: deletedVersions,
         backtest_runs: deletedBacktests,
+        shadow_runs: deletedShadowRuns,
         approvals: deletedApprovals,
         orphan_rules: orphanRules.map((r) => r.code),
       },
@@ -204,6 +255,8 @@ async function main() {
     agentRuns: await count(agentRuns),
     ruleVersions: await count(ruleVersions),
     backtestRuns: await count(backtestRuns),
+    shadowRuns: await count(shadowRuns),
+    approvals: await count(approvals),
   };
 
   console.log("Demo reset\n");
@@ -218,6 +271,7 @@ async function main() {
     console.log(`  rules removed:             ${orphanRules.map((r) => r.code).join(", ")}`);
   }
   console.log(`  approvals deleted:         ${deletedApprovals}`);
+  console.log(`  shadow runs deleted:       ${deletedShadowRuns}`);
   console.log("  untouched:                 user, transactions, audit_log");
   console.log("  audit_log:                 one 'demo.reset' entry written");
 }

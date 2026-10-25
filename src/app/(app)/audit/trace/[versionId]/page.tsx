@@ -16,6 +16,7 @@ import { CAPABILITIES, requireRoleForPage } from "@/lib/auth/guards";
 import {
   getChallengerResult,
   getImpactResult,
+  getShadowRuns,
   traceRuleVersion,
 } from "@/lib/queries";
 
@@ -51,6 +52,7 @@ export default async function TracePage({
   const { version, obligation, backtest, approval, quote } = trace;
 
   const challenger = await getChallengerResult(versionId);
+  const shadowRunRows = await getShadowRuns(versionId);
   const impact =
     backtest && obligation?.circularId
       ? await getImpactResult(obligation.circularId, backtest.id)
@@ -199,6 +201,92 @@ export default async function TracePage({
         </span>
       ),
       events: [],
+    },
+    {
+      label: "Shadow",
+      title:
+        shadowRunRows.length > 0
+          ? `${shadowRunRows.length} shadow comparison${shadowRunRows.length === 1 ? "" : "s"}`
+          : "Never run in shadow",
+      body:
+        shadowRunRows.length > 0 ? (
+          <ul className="space-y-1 text-sm">
+            {shadowRunRows.map((run) => (
+              <li key={run.id} className="flex flex-wrap items-center gap-x-2">
+                <span className="tabular-nums">
+                  {run.liveAlerts} live → {run.shadowAlerts} shadow
+                </span>
+                <span className="text-muted-foreground text-xs">
+                  +{run.alertsOnlyShadow} / −{run.alertsOnlyLive} over{" "}
+                  {run.txnsEvaluated.toLocaleString("en-US")} txns
+                </span>
+                <span className="text-muted-foreground ml-auto text-xs">
+                  {run.createdByName ?? "—"} ·{" "}
+                  {run.createdAt.toLocaleString("en-GB")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span className="text-muted-foreground text-sm">
+            This version was never observed alongside the live rule.
+          </span>
+        ),
+      events: trace.versionEvents.filter((event) =>
+        event.action.startsWith("rule_version.shadow_"),
+      ),
+    },
+    {
+      label: "Rollout",
+      title:
+        version.status === "live"
+          ? `Live${version.liveAt ? ` since ${version.liveAt.toLocaleString("en-GB")}` : ""}`
+          : version.rolloutPercent > 0
+            ? `Rolled out to ${version.rolloutPercent}% of customers`
+            : "Never rolled out",
+      body: (
+        <div className="space-y-1.5">
+          <StatusBadge status={version.status} />
+          <p className="text-muted-foreground text-sm">
+            {version.status === "retired"
+              ? "A newer version replaced this one."
+              : version.status === "live"
+                ? "In force for every customer."
+                : version.rolloutPercent > 0
+                  ? "A stable hash of customer_id decides who is on it."
+                  : "No customer has been on this version."}
+          </p>
+        </div>
+      ),
+      events: trace.versionEvents.filter(
+        (event) =>
+          event.action === "rule_version.rollout_set" ||
+          event.action === "rule_version.went_live",
+      ),
+    },
+    {
+      label: "Rollback",
+      title: version.rollbackReason
+        ? "Rolled back"
+        : "Not rolled back",
+      body: version.rollbackReason ? (
+        <div className="space-y-1.5">
+          <StatusBadge status="rolled_back" />
+          <p className="text-sm">“{version.rollbackReason}”</p>
+          {version.rolledBackAt && (
+            <p className="text-muted-foreground text-xs">
+              {version.rolledBackAt.toLocaleString("en-GB")}
+            </p>
+          )}
+        </div>
+      ) : (
+        <span className="text-muted-foreground text-sm">
+          This version is not under a rollback.
+        </span>
+      ),
+      events: trace.versionEvents.filter(
+        (event) => event.action === "rule_version.rolled_back",
+      ),
     },
   ];
 

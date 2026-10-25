@@ -5,6 +5,7 @@ import {
   FileText,
   LayoutDashboard,
   LogOut,
+  Rocket,
   ScrollText,
   Scale,
   ShieldCheck,
@@ -73,6 +74,13 @@ const NAV: NavItem[] = [
     icon: ClipboardCheck,
     roles: ["head", "auditor"],
     description: "Drafts awaiting a decision",
+  },
+  {
+    href: "/rollout",
+    label: "Rollout",
+    icon: Rocket,
+    roles: ["ops", "head", "auditor"],
+    description: "Shadow, rollout and rollback",
   },
   {
     href: "/rules",

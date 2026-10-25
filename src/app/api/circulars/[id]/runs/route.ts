@@ -8,14 +8,14 @@
  */
 import { NextResponse } from "next/server";
 
-import { currentUser } from "@/lib/auth/guards";
+import { optionalUser } from "@/lib/auth/guards";
 import { getAgentRuns, getCircular } from "@/lib/queries";
 
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const user = await currentUser();
+  const user = await optionalUser();
   if (!user) {
     return NextResponse.json({ error: "Not signed in." }, { status: 401 });
   }

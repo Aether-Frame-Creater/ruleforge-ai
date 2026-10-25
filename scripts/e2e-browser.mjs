@@ -41,6 +41,20 @@ async function main() {
 
   const shot = (name) => page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
 
+  /** The sidebar, so a nav click is never ambiguous with a card link. */
+  const nav = () => page.locator('[data-slot="sidebar"]');
+
+  /** Signs in as a demo role from wherever the browser currently is. */
+  async function signInAs(label) {
+    await page.goto(`${BASE}/login`, { waitUntil: "networkidle" });
+    if (!page.url().includes("/login")) {
+      await page.getByRole("button", { name: "Sign out" }).first().click();
+      await page.waitForURL("**/login", { timeout: 30_000 });
+    }
+    await page.getByRole("button", { name: label }).click();
+    await page.waitForURL("**/dashboard", { timeout: 30_000 });
+  }
+
   try {
     /* -- officer --------------------------------------------------------- */
 
@@ -59,7 +73,7 @@ async function main() {
     /* -- upload ---------------------------------------------------------- */
 
     step("2. Upload the demo circular");
-    await page.getByRole("link", { name: "Circulars" }).click();
+    await nav().getByRole("link", { name: "Circulars", exact: true }).click();
     await page.waitForURL("**/circulars");
     await page
       .locator('input[type="file"]')
@@ -163,7 +177,7 @@ async function main() {
     await page.waitForURL("**/dashboard", { timeout: 30_000 });
     pass("signed in as head");
 
-    await page.getByRole("link", { name: "Approvals" }).click();
+    await nav().getByRole("link", { name: "Approvals", exact: true }).click();
     await page.waitForURL("**/approvals");
     await page.waitForSelector("text=R-101", { timeout: 20_000 });
     pass("the submitted draft appears in the approvals inbox");
@@ -237,16 +251,169 @@ async function main() {
 
     /* -- ops role -------------------------------------------------------- */
 
-    step("9. Ops is view-only and cannot reach approvals or the audit trail");
-    await page.goto(`${BASE}/login`, { waitUntil: "networkidle" });
-    if (page.url().includes("/login")) {
-      await page.getByRole("button", { name: /Operations/ }).click();
-    } else {
-      await page.getByRole("button", { name: "Sign out" }).first().click();
-      await page.waitForURL("**/login");
-      await page.getByRole("button", { name: /Operations/ }).click();
+    /* -- rollout: officer and head must not be able to act ----------------- */
+
+    step("9. Officer and head cannot act on the rollout board");
+    const draftVersionId = draftUrl.split("/").pop();
+
+    for (const [label, who] of [
+      [/Compliance Officer/, "officer"],
+      [/Head of Compliance/, "head"],
+    ]) {
+      await signInAs(label);
+      await page.goto(`${BASE}/rollout`, { waitUntil: "networkidle" });
+
+      if (page.url().includes("/dashboard")) {
+        // The officer has no rollout access at all, which is stronger still.
+        pass(`${who} is redirected away from /rollout`);
+        continue;
+      }
+
+      await page.waitForSelector("text=Approved", { timeout: 20_000 });
+      const startShadow = await page
+        .getByRole("button", { name: /Start shadow/ })
+        .count();
+      if (startShadow === 0) pass(`${who} sees no Start shadow button`);
+      else fail(`${who} was offered a Start shadow button`);
     }
-    await page.waitForURL("**/dashboard", { timeout: 30_000 });
+    await shot("16-rollout-readonly");
+
+    /* -- ops drives the rollout -------------------------------------------- */
+
+    step("10. Ops starts shadow");
+    await signInAs(/Operations/);
+    await page.goto(`${BASE}/rollout`, { waitUntil: "networkidle" });
+    await page.waitForSelector("text=Approved", { timeout: 20_000 });
+    await shot("17-rollout-board");
+
+    await page.getByRole("button", { name: /Start shadow/ }).first().click();
+    await page.waitForTimeout(3500);
+    const shadowText = await page.locator("main").last().innerText();
+    if (shadowText.toLowerCase().includes("shadow")) pass("version moved into shadow");
+    else fail("the version did not move into shadow");
+
+    step("11. Ops runs a simulated day");
+    await page.getByRole("link", { name: /Compare and roll out/ }).first().click();
+    await page.waitForURL(/\/rollout\/[0-9a-f-]{36}/, { timeout: 30_000 });
+    await page.waitForSelector("text=Live versus shadow", { timeout: 20_000 });
+
+    // Rolling out before any comparison must not be possible. The server
+    // refuses it too (see scripts/check-deploy.ts); here the UI must not even
+    // offer it.
+    const rolloutDisabled = await page
+      .getByRole("button", { name: /Roll out 10%/ })
+      .isDisabled();
+    if (rolloutDisabled) pass("rollout is disabled until a shadow run exists");
+    else fail("rollout was offered before any shadow run");
+
+    await page.getByRole("button", { name: /Simulate a day of transactions/ }).click();
+    await page.waitForSelector("text=/simulated day/", { timeout: 180_000 });
+    pass("simulated day compared");
+    await shot("18-shadow-comparison");
+
+    const comparison = await page.locator("main").last().innerText();
+    for (const marker of ["Only in live", "Only in shadow", "Alert rate change"]) {
+      if (comparison.includes(marker)) pass(`comparison shows "${marker}"`);
+      else fail(`comparison is missing "${marker}"`);
+    }
+    const shadowChart = await page.locator("svg.recharts-surface").count();
+    if (shadowChart > 0) pass("live vs shadow chart rendered");
+    else fail("live vs shadow chart missing");
+
+    step("12. Ops rolls out to 10%, then 100%");
+    await page.getByRole("button", { name: /Roll out 10%/ }).click();
+    await page.waitForTimeout(3500);
+    const atTen = await page.locator("main").last().innerText();
+    if (/10%\s*$|10% of customers|Rollout\n10%/m.test(atTen) || atTen.includes("10%")) {
+      pass("rolled out to 10% of customers");
+    } else {
+      fail("the 10% rollout did not take");
+    }
+    await shot("19-rollout-10");
+
+    await page.getByRole("button", { name: /Go live \(100%\)/ }).click();
+    await page.waitForTimeout(4000);
+    const atHundred = await page.locator("main").last().innerText();
+    if (atHundred.toLowerCase().includes("live")) pass("version is live at 100%");
+    else fail("the version did not go live");
+    await shot("20-live");
+
+    step("13. The new version is live and the old one retired");
+    await page.goto(`${BASE}/rules`, { waitUntil: "networkidle" });
+    await page.waitForSelector("text=Version history", { timeout: 20_000 });
+    const rulesText = await page.locator("main").last().innerText();
+    if (/v2[\s\S]{0,80}live/i.test(rulesText)) pass("R-101 v2 is live");
+    else fail("R-101 v2 is not shown as live");
+    if (rulesText.toLowerCase().includes("retired")) pass("the previous version is retired");
+    else fail("no retired version is shown");
+    await shot("21-rules-timeline");
+
+    step("14. Ops rolls back with a reason");
+    await page.goto(`${BASE}/rollout`, { waitUntil: "networkidle" });
+    await page.waitForSelector("text=Live", { timeout: 20_000 });
+    await page.getByRole("link", { name: "Open" }).first().click();
+    await page.waitForURL(/\/rollout\/[0-9a-f-]{36}/, { timeout: 30_000 });
+
+    await page.getByRole("button", { name: /Roll back/ }).click();
+    await page.waitForSelector("text=/A reason is required/", { timeout: 10_000 });
+
+    await page.locator("textarea").fill("bad");
+    await page.getByRole("button", { name: /Roll back now/ }).click();
+    await page.waitForTimeout(1500);
+    const shortReason = await page.locator("body").innerText();
+    if (shortReason.includes("at least 10 characters")) {
+      pass("a short rollback reason is refused");
+    } else {
+      fail("the short rollback reason was accepted");
+    }
+
+    await page
+      .locator("textarea")
+      .fill("Alert volume overwhelmed the investigations team on day one.");
+    await page.getByRole("button", { name: /Roll back now/ }).click();
+    await page.waitForTimeout(4000);
+    pass("rolled back");
+    await shot("22-rolled-back");
+
+    step("15. v1 is live again");
+    await page.goto(`${BASE}/rules`, { waitUntil: "networkidle" });
+    await page.waitForSelector("text=Version history", { timeout: 20_000 });
+    const afterRollback = await page.locator("main").last().innerText();
+    if (/v1[\s\S]{0,80}live/i.test(afterRollback)) pass("R-101 v1 is live again");
+    else fail("R-101 v1 was not restored");
+    if (afterRollback.toLowerCase().includes("rolled back")) {
+      pass("v2 is shown as rolled back");
+    } else {
+      fail("v2 is not shown as rolled back");
+    }
+
+    step("16. The auditor sees the whole chain in the trace");
+    await signInAs(/Auditor/);
+    await page.goto(`${BASE}/audit/trace/${draftVersionId}`, {
+      waitUntil: "networkidle",
+    });
+    await page.waitForSelector("text=/Trace ·/", { timeout: 30_000 });
+    await page.waitForSelector("text=Rollback", { timeout: 30_000 });
+    const trace2 = (await page.locator("main").last().innerText()).toLowerCase();
+    for (const label of [
+      "circular",
+      "paragraph and quote",
+      "obligation",
+      "rule version",
+      "backtest",
+      "challenger",
+      "approval",
+      "shadow",
+      "rollout",
+      "rollback",
+    ]) {
+      if (trace2.includes(label)) pass(`trace step: ${label}`);
+      else fail(`trace step missing: ${label}`);
+    }
+    await shot("23-trace-full");
+
+    step("17. Ops is view-only for approvals and the audit trail");
+    await signInAs(/Operations/);
 
     await page.waitForSelector('[data-slot="sidebar"]', { timeout: 30_000 });
     const navText = await page
@@ -263,7 +430,7 @@ async function main() {
 
     /* -- dark mode ------------------------------------------------------- */
 
-    step("10. Dark mode");
+    step("18. Dark mode");
     await page.getByRole("button", { name: "Change theme" }).first().click();
     await page.getByRole("menuitem", { name: "Dark" }).click();
     await page.waitForTimeout(600);

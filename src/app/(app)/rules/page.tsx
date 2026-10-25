@@ -11,7 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { requireUser } from "@/lib/auth/guards";
-import { listRulesWithVersions } from "@/lib/queries";
+import { getRuleLifecycles } from "@/lib/queries";
 import { explainRule } from "@/rules/engine";
 
 export const instant = false;
@@ -28,7 +28,7 @@ function safeExplain(logic: unknown): string {
 
 export default async function RulesPage() {
   await requireUser("/rules");
-  const rules = await listRulesWithVersions();
+  const rules = await getRuleLifecycles();
 
   return (
     <>
@@ -74,31 +74,71 @@ export default async function RulesPage() {
                   <div className="text-muted-foreground mb-2 text-xs font-medium">
                     Version history
                   </div>
-                  <ul className="divide-y text-sm">
+                  <ul className="space-y-3 text-sm">
                     {rule.versions.map((version) => (
-                      <li
-                        key={version.id}
-                        className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 first:pt-0 last:pb-0"
-                      >
-                        <Link
-                          href={`/drafts/${version.id}`}
-                          className="font-mono text-xs font-medium hover:underline"
-                        >
-                          v{version.version}
-                        </Link>
-                        <StatusBadge status={version.status} />
-                        <span className="text-muted-foreground min-w-0 flex-1 truncate text-xs">
-                          {version.changeSummary ?? "—"}
-                        </span>
-                        <span className="text-muted-foreground text-xs whitespace-nowrap">
-                          {version.createdAt.toLocaleDateString("en-GB")}
-                        </span>
-                        <Link
-                          href={`/audit/trace/${version.id}`}
-                          className="text-xs hover:underline"
-                        >
-                          Trace
-                        </Link>
+                      <li key={version.id} className="border-t pt-3 first:border-0 first:pt-0">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                          <Link
+                            href={`/drafts/${version.id}`}
+                            className="font-mono text-xs font-medium hover:underline"
+                          >
+                            v{version.version}
+                          </Link>
+                          <StatusBadge status={version.status} />
+                          {version.status === "shadow" && version.rolloutPercent > 0 && (
+                            <span className="text-muted-foreground text-xs tabular-nums">
+                              {version.rolloutPercent}% rollout
+                            </span>
+                          )}
+                          <span className="text-muted-foreground min-w-0 flex-1 truncate text-xs">
+                            {version.changeSummary ?? "—"}
+                          </span>
+                          <Link
+                            href={`/audit/trace/${version.id}`}
+                            className="text-xs hover:underline"
+                          >
+                            Trace
+                          </Link>
+                        </div>
+
+                        {version.rollbackReason && (
+                          <p className="text-destructive mt-1 text-xs">
+                            Rolled back: {version.rollbackReason}
+                          </p>
+                        )}
+
+                        {/* draft → submitted → approved → shadow → live → retired */}
+                        <ol className="mt-2 flex flex-wrap items-center gap-x-1 gap-y-1.5">
+                          {version.timeline.map((step, index) => (
+                            <li key={`${step.status}-${index}`} className="flex items-center gap-1">
+                              {index > 0 && (
+                                <span className="text-muted-foreground/50 text-xs">→</span>
+                              )}
+                              <span className="bg-muted/60 rounded px-1.5 py-0.5 text-[11px]">
+                                <span className="font-medium">
+                                  {step.status.replace(/_/g, " ")}
+                                </span>
+                                {step.actor && (
+                                  <span className="text-muted-foreground">
+                                    {" "}
+                                    · {step.actor.replace(/^user:|^agent:/, "")}
+                                  </span>
+                                )}
+                                {step.at && (
+                                  <span className="text-muted-foreground">
+                                    {" "}
+                                    · {step.at.toLocaleDateString("en-GB")}
+                                  </span>
+                                )}
+                              </span>
+                            </li>
+                          ))}
+                          {version.timeline.length === 0 && (
+                            <li className="text-muted-foreground text-[11px]">
+                              No recorded lifecycle events
+                            </li>
+                          )}
+                        </ol>
                       </li>
                     ))}
                   </ul>

@@ -39,22 +39,39 @@ export class UnauthenticatedError extends Error {
   }
 }
 
-/** The signed-in user, or null. Never throws or redirects. */
-export async function currentUser(): Promise<SignedInUser | null> {
+/**
+ * The signed-in user, or null. Never throws, never redirects.
+ *
+ * Fails closed: a session whose user has no valid role yields null, exactly as
+ * no session does. There is deliberately no fallback role — an unrecognised
+ * account must not inherit any access at all. Used where "not signed in" is a
+ * legitimate state to render (the login page, sign-out, the polling endpoint).
+ */
+export async function optionalUser(): Promise<SignedInUser | null> {
   const session = await auth.api.getSession({ headers: await headers() });
   if (!session?.user) return null;
 
   const { id, name, email } = session.user;
-  // `role` is nullable in the database and defaults in the JS layer only, so a
-  // user without one is treated as the least privileged role, never the most.
   const role = (session.user as { role?: string | null }).role;
+  if (!isRole(role)) return null;
 
-  return {
-    id,
-    name,
-    email,
-    role: isRole(role) ? role : "auditor",
-  };
+  return { id, name, email, role };
+}
+
+/**
+ * The signed-in user, or a redirect to /login.
+ *
+ * Fails closed in both cases that matter: no session, and a session with no
+ * valid role. Everything that needs "who is asking" goes through this.
+ */
+export async function currentUser(returnTo?: string): Promise<SignedInUser> {
+  const user = await optionalUser();
+  if (!user) {
+    redirect(
+      returnTo ? `/login?next=${encodeURIComponent(returnTo)}` : "/login",
+    );
+  }
+  return user;
 }
 
 function isRole(value: unknown): value is UserRole {
@@ -63,19 +80,9 @@ function isRole(value: unknown): value is UserRole {
   );
 }
 
-/**
- * The signed-in user, or a redirect to the login page.
- * For pages — a redirect is the right answer for someone who is just not
- * signed in yet.
- */
+/** Page-level alias of {@link currentUser}, kept for readability at call sites. */
 export async function requireUser(returnTo?: string): Promise<SignedInUser> {
-  const user = await currentUser();
-  if (!user) {
-    redirect(
-      returnTo ? `/login?next=${encodeURIComponent(returnTo)}` : "/login",
-    );
-  }
-  return user;
+  return currentUser(returnTo);
 }
 
 /**
@@ -87,7 +94,7 @@ export async function requireUser(returnTo?: string): Promise<SignedInUser> {
 export async function requireRole(
   roles: readonly UserRole[],
 ): Promise<SignedInUser> {
-  const user = await currentUser();
+  const user = await optionalUser();
   if (!user) throw new UnauthenticatedError();
   if (!roles.includes(user.role)) throw new ForbiddenError(roles, user.role);
   return user;

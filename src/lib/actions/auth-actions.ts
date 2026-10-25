@@ -4,13 +4,13 @@ import { headers } from "next/headers";
 import { z } from "zod";
 
 import { auth } from "@/lib/auth";
-import { currentUser } from "@/lib/auth/guards";
+import { optionalUser } from "@/lib/auth/guards";
 import { env } from "@/lib/env";
 
 /**
  * The user as the sign-in response describes them.
  *
- * Taken from the response rather than read back with `currentUser()`: the
+ * Taken from the response rather than read back with `optionalUser()`: the
  * session cookie is only on the way *out* at this point, while `headers()`
  * still holds the incoming request, which has no session on it yet.
  */
@@ -146,7 +146,7 @@ export async function demoSignInAction(
 /** Ends the session and returns to the login page. */
 export async function signOutAction(): Promise<ActionResult> {
   try {
-    const user = await currentUser();
+    const user = await optionalUser();
     await auth.api.signOut({ headers: await headers() });
     if (user) {
       await writeAudit({

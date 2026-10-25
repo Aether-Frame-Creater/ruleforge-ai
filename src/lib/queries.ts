@@ -7,7 +7,7 @@
  */
 import "server-only";
 
-import { and, count, desc, eq, ilike, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 
 import {
   agentRuns,
@@ -19,6 +19,7 @@ import {
   obligations,
   rules,
   ruleVersions,
+  shadowRuns,
   user,
 } from "@/db/schema";
 import { db } from "@/lib/db";
@@ -254,6 +255,11 @@ export async function getRuleVersionDetail(ruleVersionId: string) {
       changeSummary: ruleVersions.changeSummary,
       createdByAgent: ruleVersions.createdByAgent,
       createdAt: ruleVersions.createdAt,
+      rolloutPercent: ruleVersions.rolloutPercent,
+      shadowStartedAt: ruleVersions.shadowStartedAt,
+      liveAt: ruleVersions.liveAt,
+      rolledBackAt: ruleVersions.rolledBackAt,
+      rollbackReason: ruleVersions.rollbackReason,
       submittedAt: ruleVersions.submittedAt,
       submittedById: ruleVersions.submittedBy,
       submittedByName: user.name,
@@ -631,4 +637,197 @@ export async function getImpactResult(
   }
 
   return null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Rollout                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** One rule version as the rollout board shows it. */
+export interface RolloutCard {
+  id: string;
+  version: number;
+  status: string;
+  rolloutPercent: number;
+  changeSummary: string | null;
+  jsonLogic: unknown;
+  shadowStartedAt: Date | null;
+  liveAt: Date | null;
+  ruleId: string;
+  ruleCode: string;
+  ruleName: string;
+  ruleCategory: string;
+  shadowRunCount: number;
+  latestAlertRateChangePct: string | null;
+}
+
+/** Versions in the three columns of the rollout board. */
+export async function listRolloutBoard(): Promise<{
+  approved: RolloutCard[];
+  shadow: RolloutCard[];
+  live: RolloutCard[];
+}> {
+  const rows = await db
+    .select({
+      id: ruleVersions.id,
+      version: ruleVersions.version,
+      status: ruleVersions.status,
+      rolloutPercent: ruleVersions.rolloutPercent,
+      changeSummary: ruleVersions.changeSummary,
+      jsonLogic: ruleVersions.jsonLogic,
+      shadowStartedAt: ruleVersions.shadowStartedAt,
+      liveAt: ruleVersions.liveAt,
+      ruleId: rules.id,
+      ruleCode: rules.code,
+      ruleName: rules.name,
+      ruleCategory: rules.category,
+      shadowRunCount: sql<number>`(
+        select count(*)::int from ${shadowRuns}
+        where ${shadowRuns.ruleVersionId} = ${ruleVersions.id}
+      )`,
+      latestAlertRateChangePct: sql<string | null>`(
+        select ${shadowRuns.alertRateChangePct} from ${shadowRuns}
+        where ${shadowRuns.ruleVersionId} = ${ruleVersions.id}
+        order by ${shadowRuns.createdAt} desc limit 1
+      )`,
+    })
+    .from(ruleVersions)
+    .innerJoin(rules, eq(rules.id, ruleVersions.ruleId))
+    .where(inArray(ruleVersions.status, ["approved", "shadow", "live"]))
+    .orderBy(rules.code, desc(ruleVersions.version));
+
+  return {
+    approved: rows.filter((row) => row.status === "approved"),
+    shadow: rows.filter((row) => row.status === "shadow"),
+    live: rows.filter((row) => row.status === "live"),
+  };
+}
+
+export async function getShadowRuns(ruleVersionId: string) {
+  return db
+    .select({
+      id: shadowRuns.id,
+      txnsEvaluated: shadowRuns.txnsEvaluated,
+      liveAlerts: shadowRuns.liveAlerts,
+      shadowAlerts: shadowRuns.shadowAlerts,
+      alertsOnlyLive: shadowRuns.alertsOnlyLive,
+      alertsOnlyShadow: shadowRuns.alertsOnlyShadow,
+      alertRateChangePct: shadowRuns.alertRateChangePct,
+      resultJson: shadowRuns.resultJson,
+      createdAt: shadowRuns.createdAt,
+      createdByName: user.name,
+    })
+    .from(shadowRuns)
+    .leftJoin(user, eq(user.id, shadowRuns.createdBy))
+    .where(eq(shadowRuns.ruleVersionId, ruleVersionId))
+    .orderBy(desc(shadowRuns.createdAt));
+}
+
+/**
+ * The lifecycle of every version of a rule, with who did each step and when.
+ *
+ * The timeline is built from `audit_log` rather than from the version's own
+ * columns: the columns say where a version ended up, the audit trail says how
+ * it got there, and only the trail names the person.
+ */
+export interface LifecycleStep {
+  status: string;
+  at: Date | null;
+  actor: string | null;
+}
+
+export async function getRuleLifecycles() {
+  const ruleRows = await db
+    .select({
+      id: rules.id,
+      code: rules.code,
+      name: rules.name,
+      category: rules.category,
+      currentVersionId: rules.currentVersionId,
+    })
+    .from(rules)
+    .orderBy(rules.code);
+
+  const versionRows = await db
+    .select({
+      id: ruleVersions.id,
+      ruleId: ruleVersions.ruleId,
+      version: ruleVersions.version,
+      status: ruleVersions.status,
+      jsonLogic: ruleVersions.jsonLogic,
+      changeSummary: ruleVersions.changeSummary,
+      rolloutPercent: ruleVersions.rolloutPercent,
+      createdAt: ruleVersions.createdAt,
+      createdByAgent: ruleVersions.createdByAgent,
+      rollbackReason: ruleVersions.rollbackReason,
+    })
+    .from(ruleVersions)
+    .orderBy(desc(ruleVersions.version));
+
+  // One pass over the audit trail; filtering per version in SQL would be a
+  // query per version for a page that lists every rule.
+  const events = await db
+    .select({
+      entityId: auditLog.entityId,
+      action: auditLog.action,
+      actor: auditLog.actor,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .where(eq(auditLog.entityType, "rule_versions"))
+    .orderBy(auditLog.createdAt);
+
+  /** Audit action → the lifecycle status it represents. */
+  const STEP_FOR_ACTION: Record<string, string> = {
+    "rule_version.drafted": "draft",
+    "rule_version.submitted": "submitted",
+    "rule_version.approved": "approved",
+    "rule_version.rejected": "rejected",
+    "rule_version.shadow_started": "shadow",
+    "rule_version.went_live": "live",
+    "rule_version.rolled_back": "rolled_back",
+  };
+
+  return ruleRows.map((rule) => ({
+    ...rule,
+    versions: versionRows
+      .filter((version) => version.ruleId === rule.id)
+      .map((version) => {
+        const timeline: LifecycleStep[] = [];
+        for (const event of events) {
+          if (event.entityId !== version.id) continue;
+          const status = STEP_FOR_ACTION[event.action];
+          if (!status) continue;
+          timeline.push({
+            status,
+            at: event.createdAt,
+            actor: event.actor,
+          });
+        }
+        // A version retired by a successor leaves no audit entry of its own —
+        // the successor's `went_live` records it — so it is added from status.
+        if (version.status === "retired") {
+          timeline.push({ status: "retired", at: null, actor: null });
+        }
+        return { ...version, timeline };
+      }),
+  }));
+}
+
+/** Counts for the dashboard's shadow and rollback tiles. */
+export async function deploymentCounts() {
+  const [inShadow, rolledBack] = await Promise.all([
+    db
+      .select({ n: count() })
+      .from(ruleVersions)
+      .where(eq(ruleVersions.status, "shadow")),
+    db
+      .select({ n: count() })
+      .from(ruleVersions)
+      .where(eq(ruleVersions.status, "rolled_back")),
+  ]);
+  return {
+    inShadow: inShadow[0]?.n ?? 0,
+    rolledBack: rolledBack[0]?.n ?? 0,
+  };
 }
