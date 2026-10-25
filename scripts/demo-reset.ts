@@ -14,7 +14,10 @@
  * starting from the wrong place.
  *
  * Deliberately left alone:
- * - `user` and `transactions`, so the demo does not have to be re-seeded;
+ * - `user`, so the demo does not have to be re-seeded;
+ * - the 50,000 seeded `transactions`. Rows a shadow simulation generated are
+ *   deleted, because the demo's headline backtest numbers are read off a
+ *   corpus of exactly 50,000 and a grown corpus would quietly change them;
  * - `audit_log`, which is append-only by database trigger. The reset itself is
  *   recorded there as one new entry, which is the only honest way to represent
  *   a destructive action in an insert-only trail.
@@ -36,6 +39,7 @@ import {
   rules,
   ruleVersions,
   shadowRuns,
+  transactions,
 } from "@/db/schema";
 import { db } from "@/lib/db";
 
@@ -48,7 +52,8 @@ async function confirm(): Promise<boolean> {
     const answer = await rl.question(
       "This deletes all circulars, every rule version except the seeded v1s,\n" +
         "and their approvals, backtests and shadow runs.\n" +
-        "Users, transactions and audit_log are left untouched.\n" +
+        "Users, the seeded transactions and audit_log are left untouched;\n" +
+        "simulated shadow transactions are removed.\n" +
         "Type 'reset' to continue: ",
     );
     return answer.trim().toLowerCase() === "reset";
@@ -226,7 +231,22 @@ async function main() {
     restored.push(code);
   }
 
-  /* -- 5. record the reset ------------------------------------------------ */
+  /* -- 5. simulated transactions ------------------------------------------ */
+
+  // Shadow "simulate a day" runs insert into `transactions`. They are the only
+  // rows the reset removes from that table; the seeded 50,000 are untouched.
+  const deletedSimTxns = (
+    await db
+      .delete(transactions)
+      .where(eq(transactions.isSyntheticSim, true))
+      .returning({ id: transactions.id })
+  ).length;
+
+  const seededTxnCount = await count(transactions);
+  const SEEDED_TXN_TARGET = 50_000;
+  const txnCountOk = seededTxnCount === SEEDED_TXN_TARGET;
+
+  /* -- 6. record the reset ------------------------------------------------ */
 
   await db.insert(auditLog).values({
     actor: "script:demo-reset",
@@ -244,7 +264,10 @@ async function main() {
         orphan_rules: orphanRules.map((r) => r.code),
       },
       restored_to_live_v1: restored,
-      preserved: ["user", "transactions", "audit_log"],
+      simulated_transactions_deleted: deletedSimTxns,
+      seeded_transaction_count: seededTxnCount,
+      seeded_transaction_count_ok: txnCountOk,
+      preserved: ["user", "seeded transactions", "audit_log"],
     },
   });
 
@@ -272,8 +295,24 @@ async function main() {
   }
   console.log(`  approvals deleted:         ${deletedApprovals}`);
   console.log(`  shadow runs deleted:       ${deletedShadowRuns}`);
-  console.log("  untouched:                 user, transactions, audit_log");
+  console.log(`  simulated txns deleted:    ${deletedSimTxns}`);
+  console.log(
+    `  seeded transactions:       ${seededTxnCount.toLocaleString("en-US")}` +
+      (txnCountOk
+        ? ` (expected ${SEEDED_TXN_TARGET.toLocaleString("en-US")})`
+        : `  <-- EXPECTED ${SEEDED_TXN_TARGET.toLocaleString("en-US")}`),
+  );
+  console.log("  untouched:                 user, seeded transactions, audit_log");
   console.log("  audit_log:                 one 'demo.reset' entry written");
+
+  if (!txnCountOk) {
+    console.error(
+      `\nThe transaction corpus is ${seededTxnCount}, not ${SEEDED_TXN_TARGET}. ` +
+        "Run `npm run db:seed` to restore it; the demo's backtest numbers " +
+        "depend on it.",
+    );
+    process.exitCode = 1;
+  }
 }
 
 async function count(table: PgTable): Promise<number> {

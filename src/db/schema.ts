@@ -16,6 +16,7 @@
  */
 import { relations, sql } from "drizzle-orm";
 import {
+  boolean,
   check,
   date,
   index,
@@ -288,10 +289,19 @@ export const transactions = pgTable(
     branch: text("branch"),
     country: text("country").notNull().default("IN"),
     timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    /**
+     * True for rows a shadow "simulate a day" run generated.
+     *
+     * The seeded corpus is a fixed 50,000 rows and the demo's headline numbers
+     * (R-101 at 500,000 gives 131 -> 308 alerts over 169 customers) are read
+     * off it, so backtests exclude these and `demo:reset` deletes them.
+     */
+    isSyntheticSim: boolean("is_synthetic_sim").notNull().default(false),
   },
   (table) => [
     index("transactions_timestamp_idx").on(table.timestamp),
     index("transactions_customer_id_idx").on(table.customerId),
+    index("transactions_synthetic_sim_idx").on(table.isSyntheticSim),
   ],
 );
 

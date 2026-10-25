@@ -5,7 +5,7 @@
  * This is the evidence a human approver sees before a rule goes anywhere near
  * production, so the run is recorded in `backtest_runs` and in `audit_log`.
  */
-import { asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt } from "drizzle-orm";
 
 import { auditLog, backtestRuns, ruleVersions, transactions } from "@/db/schema";
 import { db } from "@/lib/db";
@@ -112,7 +112,15 @@ export async function runBacktest({
         country: transactions.country,
       })
       .from(transactions)
-      .where(cursor ? gt(transactions.id, cursor) : undefined)
+      // Seeded rows only. Shadow simulations add rows to this table, and a
+      // backtest whose corpus grew between runs is not comparable with the
+      // one a reviewer approved.
+      .where(
+        and(
+          eq(transactions.isSyntheticSim, false),
+          cursor ? gt(transactions.id, cursor) : undefined,
+        ),
+      )
       .orderBy(asc(transactions.id))
       .limit(BACKTEST_BATCH_SIZE);
 

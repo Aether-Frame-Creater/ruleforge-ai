@@ -539,6 +539,8 @@ async function generateSimulatedDay(versionId: string): Promise<number> {
           : null,
       country: foreign ? faker.helpers.arrayElement(FOREIGN) : "IN",
       timestamp: faker.date.between({ from: dayStart, to: new Date(now) }),
+      // Marked so backtests skip them and `demo:reset` can remove them.
+      isSyntheticSim: true,
     });
   }
 
