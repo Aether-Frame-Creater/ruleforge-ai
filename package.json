@@ -18,7 +18,8 @@
     "check:rules": "tsx --env-file=.env.local scripts/check-rules.ts",
     "auth:generate": "npx @better-auth/cli@latest generate --config src/lib/auth/index.ts --output src/db/auth-schema.ts",
     "demo:circular": "tsx scripts/make-demo-circular.ts",
-    "agents:run": "tsx --env-file=.env.local scripts/run-pipeline.ts"
+    "agents:run": "tsx --env-file=.env.local scripts/run-pipeline.ts",
+    "demo:reset": "tsx --env-file=.env.local scripts/demo-reset.ts"
   },
   "dependencies": {
     "@faker-js/faker": "^10.6.0",

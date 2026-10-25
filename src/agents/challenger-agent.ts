@@ -15,6 +15,8 @@ import { GEMINI_MODEL } from "@/lib/ai/gemini";
 import { explainRule } from "@/rules/engine";
 import type { RuleLogic } from "@/rules/schema";
 
+import type { AuthorObligation } from "./rule-author-agent";
+
 import {
   defineAgent,
   envelope,
@@ -76,6 +78,8 @@ export function createChallengerAgent() {
       "Independently reviews a drafted rule against its source paragraph.",
     instruction: INSTRUCTION,
     outputSchema: challengerOutputSchema,
+    // The adversarial check is where deliberation actually pays.
+    thinking: "low",
   });
 }
 
@@ -83,14 +87,13 @@ export async function runChallengerAgent(
   ctx: PipelineContext,
   params: {
     ruleCode: string;
-    paragraphRef: string;
-    paragraphText: string;
-    quote: string;
-    obligationSummary: string;
+    /** Every obligation the draft is supposed to satisfy. */
+    obligations: AuthorObligation[];
     draftJsonLogic: RuleLogic;
     previousJsonLogic?: unknown;
     previousExplanation?: string;
     round: number;
+    concurrent?: boolean;
   },
 ): Promise<ChallengerVerdict> {
   return invokeAgent({
@@ -98,10 +101,15 @@ export async function runChallengerAgent(
     name: "challenger_agent",
     agent: createChallengerAgent(),
     schema: challengerOutputSchema,
-    responseType: "objection",
+    concurrent: params.concurrent,
+    // An objection is a rejection. A passing review is a result, and
+    // labelling it otherwise made the audit trail read as if every draft
+    // had been objected to.
+    responseType: (verdict) =>
+      verdict.verdict === "fail" ? "objection" : "result",
     request: envelope("orchestrator", "challenger_agent", "request", {
       rule_code: params.ruleCode,
-      paragraph_ref: params.paragraphRef,
+      paragraph_refs: params.obligations.map((o) => o.paragraphRef),
       round: params.round,
     }),
     parts: [
@@ -109,12 +117,16 @@ export async function runChallengerAgent(
         text: [
           `RULE UNDER REVIEW: ${params.ruleCode}`,
           "",
-          "SOURCE PARAGRAPH (untrusted document, this is the authority):",
-          untrustedBlock(params.paragraphRef, params.paragraphText),
+          params.obligations.length > 1
+            ? `The draft must satisfy all ${params.obligations.length} of these paragraphs.`
+            : "SOURCE PARAGRAPH (untrusted document, this is the authority):",
           "",
-          `VERIFIED QUOTE: "${params.quote}"`,
-          `OBLIGATION AS RECORDED: ${params.obligationSummary}`,
-          "",
+          ...params.obligations.flatMap((obligation) => [
+            untrustedBlock(obligation.paragraphRef, obligation.paragraphText),
+            `VERIFIED QUOTE: "${obligation.quote}"`,
+            `OBLIGATION AS RECORDED: ${obligation.summary}`,
+            "",
+          ]),
           params.previousJsonLogic
             ? [
                 "RULE CURRENTLY IN FORCE (what the draft would replace):",

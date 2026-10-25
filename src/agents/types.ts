@@ -9,6 +9,7 @@ import type { IntakeResult } from "./intake-agent";
 import type { MappingDecision } from "./mapping-agent";
 import type { VerifiedObligation } from "./obligation-agent";
 import type { BacktestSummary } from "@/rules/backtest";
+import type { CallTiming } from "./runtime";
 
 /** Who can send or receive an envelope. */
 export type AgentName =
@@ -107,7 +108,12 @@ export interface PipelineResult {
     llmCalls: number;
     promptTokens: number;
     candidateTokens: number;
+    thoughtTokens: number;
     totalTokens: number;
     elapsedMs: number;
+    retries: number;
+    retryCounts: { rateLimited: number; unavailable: number; other: number };
   };
+  /** Per-call timings, in completion order. */
+  timings: CallTiming[];
 }

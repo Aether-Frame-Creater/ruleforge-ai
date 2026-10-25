@@ -118,6 +118,8 @@ export function createIntakeAgent() {
       "Transcribes a regulatory circular PDF into metadata and numbered paragraphs.",
     instruction: INSTRUCTION,
     outputSchema: intakeOutputSchema,
+    // Transcription, not reasoning: thinking buys nothing here.
+    thinking: "minimal",
   });
 }
 

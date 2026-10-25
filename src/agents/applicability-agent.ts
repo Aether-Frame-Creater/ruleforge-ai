@@ -59,12 +59,13 @@ export function createApplicabilityAgent() {
       "Decides whether a circular imposes obligations on the configured bank.",
     instruction: INSTRUCTION,
     outputSchema: applicabilityOutputSchema,
+    thinking: "minimal",
   });
 }
 
 export async function runApplicabilityAgent(
   ctx: PipelineContext,
-  params: { intake: IntakeResult },
+  params: { intake: IntakeResult; concurrent?: boolean },
 ): Promise<ApplicabilityResult> {
   const paragraphs = params.intake.paragraphs
     .map((p) => `[${p.paragraphRef}] ${p.text}`)
@@ -76,6 +77,7 @@ export async function runApplicabilityAgent(
     agent: createApplicabilityAgent(),
     schema: applicabilityOutputSchema,
     responseType: "finding",
+    concurrent: params.concurrent,
     request: envelope("orchestrator", "applicability_agent", "request", {
       title: params.intake.title,
       regulator: params.intake.regulator,

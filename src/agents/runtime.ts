@@ -11,7 +11,7 @@
  * Agents are not allowed to talk to Gemini any other way.
  */
 import { InMemorySessionService, LlmAgent, Runner, isFinalResponse } from "@google/adk";
-import type { Content, Part } from "@google/genai";
+import { ThinkingLevel, type Content, type Part } from "@google/genai";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type { z } from "zod";
@@ -108,13 +108,33 @@ export class AgentOutputError extends Error {
 /* Pipeline context                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** Per-run state: budget consumption and the envelope log. */
+/** One completed call, kept so a run can print where its time went. */
+export interface CallTiming {
+  agent: string;
+  kind: "llm" | "tool";
+  ms: number;
+  /** Total attempts, so `attempts - 1` is the number of retries. */
+  attempts: number;
+  retries: number;
+  thoughtTokens: number;
+  promptTokens: number;
+  candidateTokens: number;
+  totalTokens: number;
+  /** Set when the step ran concurrently with others. */
+  concurrent?: boolean;
+}
+
+/** Per-run state: budget consumption, timings and the envelope log. */
 export class PipelineContext {
   readonly startedAt = Date.now();
   llmCalls = 0;
   promptTokens = 0;
   candidateTokens = 0;
+  thoughtTokens = 0;
   totalTokens = 0;
+  /** Retries across the whole run, by cause. */
+  readonly retryCounts = { rateLimited: 0, unavailable: 0, other: 0 };
+  readonly timings: CallTiming[] = [];
   readonly envelopes: A2AEnvelope[] = [];
 
   constructor(
@@ -145,13 +165,25 @@ export class PipelineContext {
     return envelope;
   }
 
+  recordTiming(timing: CallTiming): void {
+    this.timings.push(timing);
+  }
+
+  get totalRetries(): number {
+    const { rateLimited, unavailable, other } = this.retryCounts;
+    return rateLimited + unavailable + other;
+  }
+
   stats() {
     return {
       llmCalls: this.llmCalls,
       promptTokens: this.promptTokens,
       candidateTokens: this.candidateTokens,
+      thoughtTokens: this.thoughtTokens,
       totalTokens: this.totalTokens,
       elapsedMs: this.elapsedMs,
+      retries: this.totalRetries,
+      retryCounts: { ...this.retryCounts },
     };
   }
 }
@@ -230,6 +262,7 @@ export async function recordToolRun<T>(params: {
   name: AgentName;
   request: A2AEnvelope;
   run: () => Promise<T>;
+  concurrent?: boolean;
 }): Promise<T> {
   const runId = await openRun(params.ctx.circularId, params.name, {
     envelope: params.request,
@@ -240,9 +273,22 @@ export async function recordToolRun<T>(params: {
     const response = params.ctx.record(
       envelope(params.name, "orchestrator", "result", result),
     );
+    const durationMs = Date.now() - startedAt;
+    params.ctx.recordTiming({
+      agent: params.name,
+      kind: "tool",
+      ms: durationMs,
+      attempts: 1,
+      retries: 0,
+      thoughtTokens: 0,
+      promptTokens: 0,
+      candidateTokens: 0,
+      totalTokens: 0,
+      concurrent: params.concurrent,
+    });
     await closeRun(runId, "succeeded", {
       envelope: response,
-      duration_ms: Date.now() - startedAt,
+      timing: { duration_ms: durationMs, attempts: 1, retries: 0 },
     });
     return result;
   } catch (error) {
@@ -260,21 +306,88 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-/** True for Gemini failures that are worth retrying. */
-export function isRetryable(error: unknown): boolean {
-  const text = errorMessage(error).toLowerCase();
+/** How a failure should be treated by the retry loop. */
+export type FailureKind =
+  | "rate-limited"
+  | "unavailable"
+  | "quota-exhausted"
+  | "fatal";
+
+/** Retrying is pointless beyond this; the quota resets on a timescale of hours. */
+const MAX_SENSIBLE_RETRY_DELAY_S = 120;
+
+/**
+ * Reads the retry delay Gemini asks for, in seconds.
+ *
+ * A 429 carries `RetryInfo`. A per-minute quota asks for seconds; a per-day
+ * quota asks for hours, and backing off four times to discover that is pure
+ * waste — a 20-requests-per-day limit is not going to clear during this run.
+ */
+function retryDelaySeconds(text: string): number | null {
+  const explicit = text.match(/"retrydelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+  if (explicit) return Number(explicit[1]);
+  const prose = text.match(/please retry in\s+(?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i);
+  if (prose) {
+    const [, h = "0", m = "0", s = "0"] = prose;
+    return Number(h) * 3600 + Number(m) * 60 + Number(s);
+  }
+  return null;
+}
+
+/** Classifies a failure so the retry loop knows whether to bother. */
+export function classifyFailure(error: unknown): FailureKind {
+  const raw = errorMessage(error);
+  const text = raw.toLowerCase();
   const status = (error as { status?: number })?.status;
-  if (status === 429 || status === 503 || status === 500) return true;
-  return (
+
+  const rateLimited =
+    status === 429 ||
     text.includes("429") ||
-    text.includes("503") ||
     text.includes("resource_exhausted") ||
     text.includes("resource exhausted") ||
+    text.includes("rate limit") ||
+    text.includes("quota");
+
+  if (rateLimited) {
+    const delay = retryDelaySeconds(raw);
+    if (delay !== null && delay > MAX_SENSIBLE_RETRY_DELAY_S) {
+      return "quota-exhausted";
+    }
+    // A per-day request cap says so explicitly even without RetryInfo.
+    if (text.includes("per day") || text.includes("requests per day")) {
+      return "quota-exhausted";
+    }
+    return "rate-limited";
+  }
+
+  if (
+    status === 503 ||
+    status === 500 ||
+    text.includes("503") ||
     text.includes("unavailable") ||
     text.includes("overloaded") ||
-    text.includes("rate limit") ||
-    text.includes("quota")
-  );
+    text.includes("high demand")
+  ) {
+    return "unavailable";
+  }
+
+  return "fatal";
+}
+
+/** True for Gemini failures that are worth retrying. */
+export function isRetryable(error: unknown): boolean {
+  const kind = classifyFailure(error);
+  return kind === "rate-limited" || kind === "unavailable";
+}
+
+/** A quota failure a human has to resolve; retrying cannot help. */
+export class QuotaExhaustedError extends Error {
+  constructor(agent: string, detail: string) {
+    super(
+      `${agent}: the model's request quota is exhausted and will not reset within this run. ${detail}`,
+    );
+    this.name = "QuotaExhaustedError";
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -316,8 +429,18 @@ export interface InvokeAgentParams<S extends z.ZodType> {
   schema: S;
   /** The envelope that asked for this call. */
   request: A2AEnvelope;
-  /** Envelope type for the response. Defaults to "result". */
-  responseType?: A2AEnvelope["type"];
+  /**
+   * Envelope type for the response. Defaults to "result".
+   *
+   * A function receives the validated output, so an agent whose envelope type
+   * depends on what it found — the challenger objects only when it fails — can
+   * decide after the fact instead of mislabelling every reply.
+   */
+  responseType?:
+    | A2AEnvelope["type"]
+    | ((output: z.infer<S>) => A2AEnvelope["type"]);
+  /** Marks the call as having run concurrently, for the timing table. */
+  concurrent?: boolean;
 }
 
 /**
@@ -366,6 +489,12 @@ export async function invokeAgent<S extends z.ZodType>(
     try {
       ctx.llmCalls += 1;
       let text = "";
+      const callTokens = {
+        prompt: 0,
+        candidates: 0,
+        thoughts: 0,
+        total: 0,
+      };
 
       const iteration = (async () => {
         for await (const event of runner.runAsync({
@@ -375,9 +504,15 @@ export async function invokeAgent<S extends z.ZodType>(
           abortSignal: controller.signal,
         })) {
           if (event.usageMetadata) {
-            ctx.promptTokens += event.usageMetadata.promptTokenCount ?? 0;
-            ctx.candidateTokens += event.usageMetadata.candidatesTokenCount ?? 0;
-            ctx.totalTokens += event.usageMetadata.totalTokenCount ?? 0;
+            const usage = event.usageMetadata;
+            callTokens.prompt += usage.promptTokenCount ?? 0;
+            callTokens.candidates += usage.candidatesTokenCount ?? 0;
+            callTokens.thoughts += usage.thoughtsTokenCount ?? 0;
+            callTokens.total += usage.totalTokenCount ?? 0;
+            ctx.promptTokens += usage.promptTokenCount ?? 0;
+            ctx.candidateTokens += usage.candidatesTokenCount ?? 0;
+            ctx.thoughtTokens += usage.thoughtsTokenCount ?? 0;
+            ctx.totalTokens += usage.totalTokenCount ?? 0;
           }
           if (event.errorCode) {
             throw new Error(
@@ -420,31 +555,74 @@ export async function invokeAgent<S extends z.ZodType>(
         );
       }
 
+      const responseType =
+        typeof params.responseType === "function"
+          ? params.responseType(parsed.data)
+          : (params.responseType ?? "result");
+
       const response = ctx.record(
-        envelope(
-          name,
-          "orchestrator",
-          params.responseType ?? "result",
-          parsed.data,
-        ),
+        envelope(name, "orchestrator", responseType, parsed.data),
       );
+
+      const durationMs = Date.now() - startedAt;
+      const timing: CallTiming = {
+        agent: name,
+        kind: "llm",
+        ms: durationMs,
+        attempts: attempt,
+        retries: attempt - 1,
+        thoughtTokens: callTokens.thoughts,
+        promptTokens: callTokens.prompt,
+        candidateTokens: callTokens.candidates,
+        totalTokens: callTokens.total,
+        concurrent: params.concurrent,
+      };
+      ctx.recordTiming(timing);
+
       await closeRun(runId, "succeeded", {
         envelope: response,
-        attempts: attempt,
-        duration_ms: Date.now() - startedAt,
-        tokens: {
-          prompt: ctx.promptTokens,
-          candidates: ctx.candidateTokens,
+        // Everything needed to see where a run spent its time, per call.
+        timing: {
+          duration_ms: durationMs,
+          attempts: attempt,
+          retries: attempt - 1,
+          concurrent: params.concurrent ?? false,
         },
+        tokens: {
+          prompt: callTokens.prompt,
+          candidates: callTokens.candidates,
+          thoughts: callTokens.thoughts,
+          total: callTokens.total,
+        },
+        model: agent.model ?? null,
       });
       return parsed.data;
     } catch (error) {
       lastError = error;
+      const kind = classifyFailure(error);
+
+      // A day-scale quota is not a transient failure. Backing off four times to
+      // rediscover that wastes the run and buries the real cause.
+      if (kind === "quota-exhausted") {
+        const detail = errorMessage(error)
+          .replace(/\s+/g, " ")
+          .match(/please retry in [^.\\"]+/i)?.[0];
+        lastError = new QuotaExhaustedError(
+          name,
+          detail ?? "See https://ai.google.dev/gemini-api/docs/rate-limits.",
+        );
+        break;
+      }
 
       // Schema failures and budget breaches are not transient; only the
       // network-shaped failures get another attempt.
-      const retryable = isRetryable(error) && attempt < ctx.budget.maxRetries;
+      const retryable =
+        (kind === "rate-limited" || kind === "unavailable") &&
+        attempt < ctx.budget.maxRetries;
       if (!retryable) break;
+
+      if (kind === "rate-limited") ctx.retryCounts.rateLimited += 1;
+      else ctx.retryCounts.unavailable += 1;
 
       const backoffMs = Math.min(1_000 * 2 ** (attempt - 1), 8_000);
       const jitter = Math.floor(Math.random() * 250);
@@ -454,9 +632,36 @@ export async function invokeAgent<S extends z.ZodType>(
     }
   }
 
+  ctx.recordTiming({
+    agent: name,
+    kind: "llm",
+    ms: Date.now() - startedAt,
+    attempts: ctx.budget.maxRetries,
+    retries: ctx.totalRetries,
+    thoughtTokens: 0,
+    promptTokens: 0,
+    candidateTokens: 0,
+    totalTokens: 0,
+    concurrent: params.concurrent,
+  });
   await closeRun(runId, "failed", null, errorMessage(lastError));
   throw lastError instanceof Error ? lastError : new Error(errorMessage(lastError));
 }
+
+/**
+ * How much the model may think before answering.
+ *
+ * Set explicitly on every agent rather than left to the model's default, which
+ * is "automatic" and spends thinking tokens — and wall time — unpredictably.
+ * `minimal` suits the agents doing transcription and formatting; `low` keeps
+ * enough deliberation for the agents that read regulation and write rules.
+ */
+export type ThinkingSetting = "minimal" | "low";
+
+const THINKING_LEVELS: Record<ThinkingSetting, ThinkingLevel> = {
+  minimal: ThinkingLevel.MINIMAL,
+  low: ThinkingLevel.LOW,
+};
 
 /** Builds an agent with the security preamble already attached. */
 export function defineAgent(params: {
@@ -465,6 +670,8 @@ export function defineAgent(params: {
   description: string;
   instruction: string;
   outputSchema: z.ZodType;
+  /** Required: no agent gets to inherit the model's default thinking budget. */
+  thinking: ThinkingSetting;
   temperature?: number;
 }): LlmAgent {
   return new LlmAgent({
@@ -475,6 +682,10 @@ export function defineAgent(params: {
     outputSchema: params.outputSchema as never,
     generateContentConfig: {
       temperature: params.temperature ?? 0,
+      thinkingConfig: {
+        thinkingLevel: THINKING_LEVELS[params.thinking],
+        includeThoughts: false,
+      },
     },
     // These agents are leaves driven by the orchestrator, never a tree.
     disallowTransferToParent: true,

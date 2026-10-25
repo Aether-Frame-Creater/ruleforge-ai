@@ -137,6 +137,8 @@ export function createObligationAgent() {
       "Extracts obligations from a circular, each citing a paragraph and an exact quote.",
     instruction: INSTRUCTION,
     outputSchema: obligationOutputSchema,
+    // Reads regulation and must quote it exactly: keep some deliberation.
+    thinking: "low",
   });
 }
 

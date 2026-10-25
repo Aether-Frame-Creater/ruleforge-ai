@@ -7,6 +7,7 @@
  * into storage/circulars/, runs the pipeline, and prints the full case file.
  * Nothing it produces is approved: every rule version comes out as a draft.
  */
+import { existsSync } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -19,7 +20,6 @@ import { audit } from "@/agents/runtime";
 import { circulars, user } from "@/db/schema";
 import { db } from "@/lib/db";
 
-const DEFAULT_PDF = "samples/circulars/demo-aml-cash-threshold.pdf";
 const STORAGE_DIR = "storage/circulars";
 const UPLOADER_EMAIL = "officer@ruleforge.demo";
 
@@ -39,7 +39,29 @@ async function main() {
   // ADK logs every request at INFO; the pipeline prints its own progress.
   setLogLevel(LogLevel.WARN);
 
-  const source = process.argv[2] ?? DEFAULT_PDF;
+  // No silent default: running the pipeline costs model calls and writes a
+  // circular, so it must be obvious which document is being processed.
+  const source = process.argv[2];
+  if (!source) {
+    console.error("usage: npm run agents:run -- <path-to-circular.pdf>\n");
+    console.error("example:");
+    console.error(
+      "  npm run agents:run -- samples/circulars/demo-aml-cash-threshold.pdf\n",
+    );
+    console.error("Generate the demo circular with: npm run demo:circular");
+    process.exit(2);
+  }
+
+  if (!source.toLowerCase().endsWith(".pdf")) {
+    console.error(`${source} is not a .pdf file.`);
+    process.exit(2);
+  }
+
+  if (!existsSync(source)) {
+    console.error(`${source} does not exist.`);
+    process.exit(2);
+  }
+
   const startedAt = Date.now();
 
   const [uploader] = await db
@@ -212,11 +234,40 @@ async function main() {
     console.log(`    ${env.timestamp}  ${env.from} -> ${env.to}  [${env.type}]`);
   }
 
+  /* -- timing ------------------------------------------------------------- */
+
+  section("timing per call");
+  console.log(
+    "  agent                 kind   seconds  retries  thinking  tokens  concurrent",
+  );
+  for (const call of result.timings) {
+    console.log(
+      `  ${call.agent.padEnd(20)}  ${call.kind.padEnd(5)}  ${(call.ms / 1000)
+        .toFixed(1)
+        .padStart(7)}  ${String(call.retries).padStart(7)}  ${String(
+        call.thoughtTokens,
+      ).padStart(8)}  ${String(call.totalTokens).padStart(6)}  ${
+        call.concurrent ? "yes" : "no"
+      }`,
+    );
+  }
+  const summed = result.timings.reduce((total, call) => total + call.ms, 0);
+  console.log(
+    `  ${"".padEnd(20)}  ${"total".padEnd(5)}  ${(summed / 1000).toFixed(1).padStart(7)}` +
+      "   (sum of calls; concurrent ones overlap in wall time)",
+  );
+
   section("usage");
   console.log(`  LLM calls:        ${result.stats.llmCalls}`);
   console.log(`  prompt tokens:    ${money(result.stats.promptTokens)}`);
   console.log(`  candidate tokens: ${money(result.stats.candidateTokens)}`);
+  console.log(`  thinking tokens:  ${money(result.stats.thoughtTokens)}`);
   console.log(`  total tokens:     ${money(result.stats.totalTokens)}`);
+  console.log(
+    `  retries:          ${result.stats.retries}` +
+      ` (rate-limited ${result.stats.retryCounts.rateLimited},` +
+      ` unavailable ${result.stats.retryCounts.unavailable})`,
+  );
   console.log(
     `  pipeline time:    ${(result.stats.elapsedMs / 1000).toFixed(1)}s`,
   );

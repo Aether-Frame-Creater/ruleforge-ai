@@ -60,6 +60,8 @@ export function createImpactAgent() {
     description: "Summarises a backtest result and assigns a risk level.",
     instruction: INSTRUCTION,
     outputSchema: impactOutputSchema,
+    // Rewrites numbers it is given; no deliberation required.
+    thinking: "minimal",
     temperature: 0.2,
   });
 }
@@ -70,6 +72,7 @@ export async function runImpactAgent(
     ruleCode: string;
     backtest: BacktestSummary;
     changeSummary: string;
+    concurrent?: boolean;
   },
 ): Promise<ImpactAssessment> {
   const { backtest } = params;
@@ -83,6 +86,7 @@ export async function runImpactAgent(
     name: "impact_agent",
     agent: createImpactAgent(),
     schema: impactOutputSchema,
+    concurrent: params.concurrent,
     request: envelope("orchestrator", "impact_agent", "request", {
       rule_code: params.ruleCode,
       backtest_run_id: backtest.backtest_run_id,

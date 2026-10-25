@@ -55,12 +55,25 @@ export interface AuthoredRule {
   attempts: number;
 }
 
-export interface RuleAuthorRequest {
-  obligationSummary: string;
+/** One obligation the rule has to satisfy. */
+export interface AuthorObligation {
+  summary: string;
   paragraphRef: string;
   /** The exact source paragraph, so the author works from primary text. */
   paragraphText: string;
   quote: string;
+}
+
+export interface RuleAuthorRequest {
+  /**
+   * Every obligation this one rule version must satisfy.
+   *
+   * More than one obligation can bear on the same rule. They are authored
+   * together so the result satisfies all of them at once: drafting them
+   * separately produced independent versions baselined on the same parent, and
+   * the later draft silently reverted the earlier one.
+   */
+  obligations: AuthorObligation[];
   /** The rule being modified, if any. */
   target?: {
     code: string;
@@ -70,6 +83,8 @@ export interface RuleAuthorRequest {
   };
   /** Challenger objections from a previous round, if this is a revision. */
   objections?: string[];
+  /** Marks the call as concurrent, for the timing table. */
+  concurrent?: boolean;
 }
 
 const CONTRACT_BRIEF = `
@@ -122,6 +137,7 @@ export function createRuleAuthorAgent() {
     description: "Writes json-logic rules that satisfy a mapped obligation.",
     instruction: INSTRUCTION,
     outputSchema: ruleAuthorOutputSchema,
+    thinking: "low",
   });
 }
 
@@ -146,18 +162,23 @@ function buildPrompt(
   }
 
   lines.push(
-    "OBLIGATION (derived from an untrusted document):",
-    `  ${request.obligationSummary}`,
-    `  cited paragraph: ${request.paragraphRef}`,
-    "",
-    untrustedBlock(
-      `${request.paragraphRef} (source text)`,
-      request.paragraphText,
-    ),
-    "",
-    `VERIFIED QUOTE: "${request.quote}"`,
+    request.obligations.length > 1
+      ? `OBLIGATIONS (${request.obligations.length}, all of which this one rule must satisfy):`
+      : "OBLIGATION (derived from an untrusted document):",
     "",
   );
+
+  for (const obligation of request.obligations) {
+    lines.push(
+      `  ${obligation.paragraphRef}: ${obligation.summary}`,
+      untrustedBlock(
+        `${obligation.paragraphRef} (source text)`,
+        obligation.paragraphText,
+      ),
+      `  VERIFIED QUOTE: "${obligation.quote}"`,
+      "",
+    );
+  }
 
   if (request.objections?.length) {
     lines.push(
@@ -203,8 +224,9 @@ export async function runRuleAuthorAgent(
       name: "rule_author_agent",
       agent,
       schema: ruleAuthorOutputSchema,
+      concurrent: request.concurrent,
       request: envelope("orchestrator", "rule_author_agent", "request", {
-        paragraph_ref: request.paragraphRef,
+        paragraph_refs: request.obligations.map((o) => o.paragraphRef),
         target_rule: request.target?.code ?? null,
         attempt,
         validation_errors: validationErrors,

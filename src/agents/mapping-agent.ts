@@ -106,6 +106,7 @@ export function createMappingAgent() {
       "Maps obligations onto existing rules, new rules, or no rule change.",
     instruction: INSTRUCTION,
     outputSchema: mappingOutputSchema,
+    thinking: "low",
   });
 }
 
