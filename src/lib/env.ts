@@ -10,7 +10,10 @@ const envSchema = z.object({
   BETTER_AUTH_SECRET: z.string().min(32),
   BETTER_AUTH_URL: z.string().url(),
   GOOGLE_API_KEY: z.string().min(1),
-  GEMINI_MODEL: z.string().default("gemini-2.5-pro"),
+  /** Main reasoning model: obligation extraction, rule drafting, review. */
+  GEMINI_MODEL: z.string().default("gemini-3.8-flash"),
+  /** Cheap model for high-volume, low-stakes calls: chunk triage, labelling. */
+  GEMINI_MODEL_LITE: z.string().default("gemini-3.5-flash-lite"),
 });
 
 const parsed = envSchema.safeParse(process.env);

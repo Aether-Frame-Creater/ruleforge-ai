@@ -8,5 +8,14 @@ export const genai = new GoogleGenAI({ apiKey: env.GOOGLE_API_KEY });
 /** Default model for agent reasoning and structured extraction. */
 export const GEMINI_MODEL = env.GEMINI_MODEL;
 
+/** Cheaper, faster model for high-volume calls (chunk triage, labelling). */
+export const GEMINI_MODEL_LITE = env.GEMINI_MODEL_LITE;
+
 /** Model used for pgvector embeddings of circular chunks. */
 export const EMBEDDING_MODEL = "gemini-embedding-001";
+
+/**
+ * Output dimensionality requested from {@link EMBEDDING_MODEL}. Must stay in
+ * step with the `vector(768)` column on `circular_chunks.embedding`.
+ */
+export const EMBEDDING_DIMENSIONS = 768;
