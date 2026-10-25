@@ -14,6 +14,12 @@ const envSchema = z.object({
   GEMINI_MODEL: z.string().default("gemini-3.8-flash"),
   /** Cheap model for high-volume, low-stakes calls: chunk triage, labelling. */
   GEMINI_MODEL_LITE: z.string().default("gemini-3.5-flash-lite"),
+  /**
+   * Password for the demo users created by `npm run db:seed`. Optional so the
+   * app still boots without it; the seed script fails loudly if it is missing.
+   * Better Auth requires at least 8 characters.
+   */
+  DEMO_PASSWORD: z.string().min(8).optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

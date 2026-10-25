@@ -30,3 +30,13 @@ DROP TRIGGER IF EXISTS audit_log_no_truncate ON audit_log;
 CREATE TRIGGER audit_log_no_truncate
   BEFORE TRUNCATE ON audit_log
   FOR EACH STATEMENT EXECUTE FUNCTION audit_log_reject_mutation();
+
+-- `user.role` is a plain text column, because Better Auth's generator emits
+-- `text` for `additionalFields` and the generated file is overwritten by
+-- `npm run auth:generate`. Enforce the allowed values here instead, so a
+-- stray UPDATE cannot invent a role the application does not understand.
+--
+-- NULL stays legal: the column is nullable and defaults to 'officer'.
+ALTER TABLE "user" DROP CONSTRAINT IF EXISTS user_role_allowed;
+ALTER TABLE "user" ADD CONSTRAINT user_role_allowed
+  CHECK (role IS NULL OR role IN ('officer', 'head', 'ops', 'auditor'));
