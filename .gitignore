@@ -48,3 +48,4 @@ next-env.d.ts
 
 # recorded model responses for LLM_MODE=replay
 /storage/llm-cache
+storage/e2e/
