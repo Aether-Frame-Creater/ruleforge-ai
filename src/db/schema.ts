@@ -83,6 +83,8 @@ export const ruleCategoryEnum = pgEnum("rule_category", [
 
 export const ruleVersionStatusEnum = pgEnum("rule_version_status", [
   "draft",
+  // An officer has put the draft forward; it is now awaiting a head's decision.
+  "submitted",
   "approved",
   "shadow",
   "live",
@@ -231,6 +233,11 @@ export const ruleVersions = pgTable(
       onDelete: "set null",
     }),
     status: ruleVersionStatusEnum("status").notNull().default("draft"),
+    /** Who put this version forward for approval, and when. */
+    submittedBy: text("submitted_by").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
     changeSummary: text("change_summary"),
     /** Which agent drafted it, e.g. "rule_drafter". */
     createdByAgent: text("created_by_agent"),
@@ -374,6 +381,9 @@ export const auditLog = pgTable(
 export const userAppRelations = relations(user, ({ many }) => ({
   uploadedCirculars: many(circulars),
   reviewedObligations: many(obligations),
+  submittedRuleVersions: many(ruleVersions, {
+    relationName: "ruleVersionSubmitter",
+  }),
   approvalsAsMaker: many(approvals, { relationName: "approvalMaker" }),
   approvalsAsChecker: many(approvals, { relationName: "approvalChecker" }),
 }));
@@ -435,6 +445,11 @@ export const ruleVersionsRelations = relations(
     obligation: one(obligations, {
       fields: [ruleVersions.obligationId],
       references: [obligations.id],
+    }),
+    submitter: one(user, {
+      fields: [ruleVersions.submittedBy],
+      references: [user.id],
+      relationName: "ruleVersionSubmitter",
     }),
     backtestRuns: many(backtestRuns, { relationName: "backtestCandidate" }),
     baselineForBacktestRuns: many(backtestRuns, {

@@ -34,8 +34,9 @@ function section(title: string) {
 }
 
 const MODE_NOTES: Record<ReturnType<typeof llmMode>, string> = {
-  live: "  (always calls the API; cache not read or written)",
-  record: `  (calls the API, saving responses to ${CACHE_DIR})`,
+  cache: `  (read-through: uses ${CACHE_DIR} when it can, else calls and saves)`,
+  live: `  (always calls the API, then saves to ${CACHE_DIR})`,
+  record: `  (always calls the API, saving responses to ${CACHE_DIR})`,
   replay: "  (serves saved responses only; no API calls)",
 };
 

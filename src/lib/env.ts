@@ -22,11 +22,21 @@ const envSchema = z.object({
   GEMINI_MODEL_FALLBACK: z.string().optional(),
   /**
    * How agent calls reach Gemini:
-   * - `live`   always calls the API and never touches the cache;
-   * - `record` calls the API and saves each response for later replay;
+   * - `cache`  read-through: serves a saved response when one exists, otherwise
+   *            calls the API and saves the result (the default);
+   * - `record` always calls the API and saves each response;
+   * - `live`   always calls the API and saves, ignoring what is already cached;
    * - `replay` serves saved responses only and never calls the API.
    */
-  LLM_MODE: z.enum(["live", "record", "replay"]).default("record"),
+  LLM_MODE: z.enum(["cache", "live", "record", "replay"]).default("cache"),
+  /**
+   * Shows one-click sign-in buttons for the seeded demo users on the login
+   * page. Never enable this anywhere real: it hands out sessions.
+   */
+  DEMO_MODE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   /**
    * Password for the demo users created by `npm run db:seed`. Optional so the
    * app still boots without it; the seed script fails loudly if it is missing.

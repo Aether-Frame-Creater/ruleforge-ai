@@ -1,5 +1,6 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { nextCookies } from "better-auth/next-js";
 
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
@@ -23,6 +24,11 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
   },
+  session: {
+    // The pitch switches roles repeatedly; a short cookie cache would serve a
+    // stale role for up to its lifetime, so sessions are read fresh.
+    cookieCache: { enabled: false },
+  },
   user: {
     additionalFields: {
       role: {
@@ -35,6 +41,8 @@ export const auth = betterAuth({
       },
     },
   },
+  // Must stay last: it is what lets a server action set the session cookie.
+  plugins: [nextCookies()],
 });
 
 export type Session = typeof auth.$Infer.Session;

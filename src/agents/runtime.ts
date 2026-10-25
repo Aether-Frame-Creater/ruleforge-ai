@@ -605,17 +605,20 @@ export async function invokeAgent<S extends z.ZodType>(
 
   /** Produces the response text, from the cache or the API as the mode allows. */
   async function produce(): Promise<Generation> {
-    if (mode === "replay") {
+    if (mode === "replay" || mode === "cache") {
       const cached = await readCached<CachedGeneration>(key);
-      if (!cached) throw new ReplayMissError(name, key);
-      ctx.replayedCalls += 1;
-      return {
-        text: cached.text,
-        usage: cached.usage,
-        modelUsed: cached.modelUsed,
-        attempts: 1,
-        fromCache: true,
-      };
+      if (cached) {
+        ctx.replayedCalls += 1;
+        return {
+          text: cached.text,
+          usage: cached.usage,
+          modelUsed: cached.modelUsed,
+          attempts: 1,
+          fromCache: true,
+        };
+      }
+      // `replay` has nowhere else to go; `cache` falls through to the API.
+      if (mode === "replay") throw new ReplayMissError(name, key);
     }
 
     let active = spec;
@@ -694,7 +697,7 @@ export async function invokeAgent<S extends z.ZodType>(
       );
     }
 
-    if (mode === "record" && !generation.fromCache) {
+    if (mode !== "replay" && !generation.fromCache) {
       const entry: CachedGeneration = {
         kind: "generate",
         model: spec.model,

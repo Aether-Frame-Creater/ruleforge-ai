@@ -59,10 +59,10 @@ async function embedBatch(
     parts: texts.map((text) => ({ text })),
   });
 
-  if (mode === "replay") {
+  if (mode === "replay" || mode === "cache") {
     const cached = await readCached<CachedEmbeddings>(key);
-    if (!cached) throw new ReplayMissError("embeddings", key);
-    return cached.embeddings;
+    if (cached) return cached.embeddings;
+    if (mode === "replay") throw new ReplayMissError("embeddings", key);
   }
 
   let lastError: unknown;
@@ -83,7 +83,8 @@ async function embedBatch(
         return values && values.length === EMBEDDING_DIMENSIONS ? values : null;
       });
 
-      if (mode === "record") {
+      // Every mode that reaches the API saves the result; `replay` returned above.
+      {
         const entry: CachedEmbeddings = {
           kind: "embed",
           model: EMBEDDING_MODEL,

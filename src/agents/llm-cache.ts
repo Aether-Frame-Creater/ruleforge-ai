@@ -2,8 +2,10 @@
  * Response cache for model calls, so development does not burn a daily quota.
  *
  * `LLM_MODE` picks the behaviour:
- * - `live`   — always calls the API, never reads or writes the cache;
- * - `record` — calls the API and saves every response (the default);
+ * - `cache`  — read-through: a saved response is used when one exists, otherwise
+ *              the API is called and the result saved (the default);
+ * - `record` — always calls the API and saves the response;
+ * - `live`   — always calls the API and saves, ignoring what is already cached;
  * - `replay` — serves saved responses only, and never calls the API at all.
  *
  * The cache key covers everything that could change an answer: the model asked
@@ -20,7 +22,7 @@ import { join } from "node:path";
 
 import { env } from "@/lib/env";
 
-export type LlmMode = "live" | "record" | "replay";
+export type LlmMode = "cache" | "live" | "record" | "replay";
 
 export const CACHE_DIR = "storage/llm-cache";
 
