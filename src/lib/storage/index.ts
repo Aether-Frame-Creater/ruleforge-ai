@@ -96,20 +96,40 @@ function blobStorage(): Storage {
     async put(key, body, contentType) {
       assertSafeKey(key);
       const { put } = await import("@vercel/blob");
-      const result = await put(key, body, {
-        access: "public",
-        contentType,
-        // The key already carries a UUID, so Vercel must not add another
-        // suffix — otherwise the key we store would not be the key that exists.
-        addRandomSuffix: false,
-        token: env.BLOB_READ_WRITE_TOKEN,
-      });
+      let result;
+      try {
+        result = await put(key, body, {
+          access: "public",
+          contentType,
+          // The key already carries a UUID, so Vercel must not add another
+          // suffix — otherwise the key we store would not be the key that exists.
+          addRandomSuffix: false,
+          token: env.BLOB_READ_WRITE_TOKEN,
+        });
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          err.message.includes("Cannot use public access on a private store")
+        ) {
+          result = await put(key, body, {
+            access: "private",
+            contentType,
+            addRandomSuffix: false,
+            token: env.BLOB_READ_WRITE_TOKEN,
+          });
+        } else {
+          throw err;
+        }
+      }
       return { key: result.url, size: body.length, url: result.url };
     },
 
     async get(key) {
-      // A blob key is its own public URL, so a fetch is the read path.
-      const response = await fetch(key, { cache: "no-store" });
+      const headers: Record<string, string> = {};
+      if (env.BLOB_READ_WRITE_TOKEN) {
+        headers.authorization = `Bearer ${env.BLOB_READ_WRITE_TOKEN}`;
+      }
+      const response = await fetch(key, { headers, cache: "no-store" });
       if (!response.ok) {
         throw new Error(
           `Could not read ${key} from Vercel Blob: ${response.status} ${response.statusText}`,
