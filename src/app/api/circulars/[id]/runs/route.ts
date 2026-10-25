@@ -28,6 +28,19 @@ export async function GET(
 
   const runs = await getAgentRuns(id);
 
+  const working = runs.some(
+    (run) => run.status === "running" || run.status === "queued",
+  );
+  const lastActivity = runs.reduce((latest, run) => {
+    const at = (run.finishedAt ?? run.startedAt)?.getTime() ?? 0;
+    return at > latest ? at : latest;
+  }, 0);
+
+  // A slice that ended without finishing leaves the circular `analysing` with
+  // nothing running. That is the signal for the client to ask for another one.
+  const idleMs = lastActivity > 0 ? Date.now() - lastActivity : 0;
+  const stalled = circular.status === "analysing" && !working && idleMs > 5_000;
+
   return NextResponse.json(
     {
       status: circular.status,
@@ -36,7 +49,10 @@ export async function GET(
       settled:
         circular.status !== "uploaded" &&
         circular.status !== "analysing" &&
-        !runs.some((run) => run.status === "running" || run.status === "queued"),
+        !working,
+      /** The run paused between slices and can be continued. */
+      stalled,
+      idleSeconds: Math.round(idleMs / 1000),
     },
     { headers: { "cache-control": "no-store" } },
   );

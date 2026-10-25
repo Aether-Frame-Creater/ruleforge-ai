@@ -7,10 +7,11 @@ import {
   Circle,
   Loader2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { StatusBadge } from "@/components/app/status-badge";
+import { continueCircularAction } from "@/lib/actions/circular-actions";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -49,6 +50,15 @@ interface Envelope {
 
 const POLL_MS = 2_000;
 
+/**
+ * How many times the client will ask the server to continue a paused run.
+ *
+ * A serverless invocation can only do so much, so a long pipeline finishes
+ * over several. The cap stops a genuinely broken run from being nudged for
+ * ever — after it, the run is reported as stalled for a human to look at.
+ */
+const MAX_CONTINUES = 12;
+
 function isEnvelope(value: unknown): value is Envelope {
   return (
     typeof value === "object" &&
@@ -80,6 +90,8 @@ export function AgentTimeline({
   const [runs, setRuns] = useState(initialRuns);
   const [settled, setSettled] = useState(initialSettled);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const continues = useRef(0);
 
   useEffect(() => {
     if (settled) return;
@@ -96,11 +108,32 @@ export function AgentTimeline({
         const data = (await response.json()) as {
           runs: AgentRun[];
           settled: boolean;
+          stalled?: boolean;
+          idleSeconds?: number;
         };
         if (cancelled) return;
 
         setRuns(data.runs);
         setError(null);
+
+        // The previous slice ran out of invocation time. Ask for another.
+        if (data.stalled && !data.settled) {
+          if (continues.current < MAX_CONTINUES) {
+            continues.current += 1;
+            setNotice(
+              `Resuming — step ${continues.current} of up to ${MAX_CONTINUES}.`,
+            );
+            await continueCircularAction({ circularId });
+          } else {
+            setNotice(
+              `This run has been idle for ${data.idleSeconds ?? 0}s and has stopped making progress. ` +
+                "It may have failed; check the audit trail.",
+            );
+            setSettled(true);
+            router.refresh();
+            return;
+          }
+        }
 
         if (data.settled) {
           setSettled(true);
@@ -156,6 +189,7 @@ export function AgentTimeline({
 
       <CardContent className="space-y-4">
         {error && <p className="text-muted-foreground text-xs">{error}</p>}
+        {notice && <p className="text-muted-foreground text-xs">{notice}</p>}
 
         {runs.length === 0 ? (
           <p className="text-muted-foreground text-sm">

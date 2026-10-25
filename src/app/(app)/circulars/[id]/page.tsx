@@ -25,6 +25,9 @@ import {
 
 export const instant = false;
 
+/** The page hosts the `continue` action that runs later pipeline slices. */
+export const maxDuration = 60;
+
 export default async function CircularPage({
   params,
 }: PageProps<"/circulars/[id]">) {

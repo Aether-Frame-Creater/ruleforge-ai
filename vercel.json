@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "regions": ["bom1"],
+  "functions": {
+    "src/app/(app)/circulars/page.tsx": { "maxDuration": 60 },
+    "src/app/(app)/circulars/[id]/page.tsx": { "maxDuration": 60 }
+  }
+}

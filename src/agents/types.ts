@@ -94,6 +94,8 @@ export interface CaseFile {
 }
 
 export type PipelineOutcome =
+  /** Ran out of invocation time at a stage boundary; call again to continue. */
+  | "incomplete"
   | "not_applicable"
   | "no_obligations"
   | "no_rule_changes"

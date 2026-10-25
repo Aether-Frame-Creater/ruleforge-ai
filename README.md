@@ -276,6 +276,9 @@ cp .env.example .env.local
 | `LLM_MODE` | no | `cache` (default), `live`, `record`, `replay` |
 | `DEMO_PASSWORD` | for seeding | Password for the four demo users, ≥8 chars |
 | `DEMO_MODE` | no | `true` shows one-click demo logins. **Never in production** |
+| `STORAGE_DRIVER` | no | `local` (default) writes to `storage/`; `blob` uses Vercel Blob |
+| `BLOB_READ_WRITE_TOKEN` | with `blob` | Injected by Vercel when a Blob store is linked |
+| `PIPELINE_MAX_SECONDS` | no | Default `55`. Invocation budget before the pipeline pauses |
 
 ### 4. Schema and seed data
 
@@ -317,6 +320,9 @@ roles. Otherwise sign in as `officer@ruleforge.demo` with your `DEMO_PASSWORD`.
 | `npm run check:rules` | Rule contract, engine and backtest checks |
 | `npm run check:deploy` | Deployment guard checks (roles, agents, state) |
 | `npm run auth:generate` | Regenerate the Better Auth tables |
+| `npm run db:deploy` | Migrations + guards against a target database |
+| `npm run cache:export` | LLM cache table → JSON file |
+| `npm run cache:import` | JSON file (or a legacy `storage/llm-cache` folder) → table |
 
 > ### ⚠️ Use `db:sync`, never a bare `db:push`
 >
@@ -343,8 +349,10 @@ Development would otherwise burn a daily API quota on every run.
 The cache key is a SHA-256 of the model, the full system instruction and every
 prompt part **including the PDF bytes**. Change a prompt and the old entry is
 never looked up again — a stale response cannot stand in for a new one. Entries
-live in `storage/llm-cache/` (git-ignored). Embeddings are cached too, so a
-`replay` run genuinely makes zero API calls.
+live in the `llm_cache` table — not on disk, because a serverless deployment
+has no writable filesystem and a shared table means a warm cache is not
+rebuilt per container. Embeddings are cached too, so a `replay` run genuinely
+makes zero API calls.
 
 In `replay` mode a cache miss fails with a message naming the agent and telling
 you to run `record` first.
@@ -416,6 +424,114 @@ one-click button for that role.
 | `auditor` | Read-only everywhere, plus the audit trail |
 
 Enforced server-side on every action and page, not by hiding buttons.
+
+---
+
+## Deploying to Vercel
+
+Vercel's filesystem is **read-only at runtime**, so two things that work
+locally have to move: uploaded PDFs go to Vercel Blob, and the LLM cache lives
+in Postgres rather than on disk. Both are driven by environment variables;
+nothing in the code branches on "am I on Vercel".
+
+### 1. Database
+
+Neon gives you two connection strings and **the difference matters**:
+
+| String | Host contains | Used by | Why |
+|---|---|---|---|
+| **Pooled** | `-pooler` | `DATABASE_URL` — the app | Serverless functions open and drop connections constantly; without the pooler you exhaust Postgres connection slots |
+| **Direct** | no `-pooler` | `DATABASE_URL_UNPOOLED` — migrations, scripts | The pooler does not support every DDL statement |
+
+Set up a fresh database:
+
+```bash
+# once, against the target database
+node scripts/run-sql.mjs src/db/extensions.sql   # pgvector
+npm run db:deploy                                 # migrations + guards
+npm run db:seed                                   # demo users, rules, 50k txns
+```
+
+`db:deploy` runs `drizzle-kit migrate` (the reviewed migration files, not a
+live `push`) and then re-installs the guards, which `migrate` does not know
+about.
+
+### 2. Blob storage
+
+Vercel dashboard → **Storage** → **Create** → **Blob** → connect it to the
+project. That injects `BLOB_READ_WRITE_TOKEN` automatically. Then set
+`STORAGE_DRIVER=blob`.
+
+### 3. Environment variables
+
+Every variable, where it comes from, and whether a deployment needs it:
+
+| Variable | Required | Where to get it |
+|---|---|---|
+| `DATABASE_URL` | **yes** | Neon → Connection Details → **Pooled** |
+| `DATABASE_URL_UNPOOLED` | **yes** | Neon → Connection Details → **Direct** |
+| `BETTER_AUTH_SECRET` | **yes** | `openssl rand -base64 32` |
+| `BETTER_AUTH_URL` | **yes** | Your deployment URL, `https://…`. Must match exactly |
+| `NEXT_PUBLIC_APP_URL` | **yes** | The same URL again |
+| `GOOGLE_API_KEY` | **yes** | [Google AI Studio](https://aistudio.google.com/apikey) |
+| `STORAGE_DRIVER` | **yes** | `blob` |
+| `BLOB_READ_WRITE_TOKEN` | **yes** | Injected by linking a Blob store |
+| `GEMINI_MODEL` | no | Default `gemini-3.5-flash` |
+| `GEMINI_MODEL_LITE` | no | Default `gemini-3.5-flash-lite` |
+| `GEMINI_MODEL_FALLBACK` | no | Stand-in when the main model's quota is gone |
+| `LLM_MODE` | no | `cache` default; `replay` for a quota-proof demo |
+| `PIPELINE_MAX_SECONDS` | no | Default `55`. Must stay under the function `maxDuration` |
+| `DEMO_PASSWORD` | for seeding | Any string ≥8 characters |
+| `DEMO_MODE` | no | `true` enables one-click role switching. **Never with real data** |
+
+See [`.env.production.example`](.env.production.example).
+
+### 4. HTTPS and cookies
+
+`BETTER_AUTH_URL` and `NEXT_PUBLIC_APP_URL` must both be the **https** origin
+the app is actually served from. Better Auth issues the session cookie for that
+origin and checks `Origin` on requests; a mismatch shows up as a sign-in that
+appears to succeed and then bounces back to the login page. On an `https` URL
+the cookie is automatically `Secure` with `SameSite=Lax`, which is what the
+app needs — no extra configuration.
+
+If you use a custom domain, update both variables and redeploy; a preview
+deployment has a different URL and needs its own values to be signed in.
+
+### 5. Function duration and the pipeline
+
+The agent pipeline can take longer than one serverless invocation. It is built
+to survive that:
+
+- `maxDuration = 60` on the circular routes (the Vercel Hobby ceiling).
+- `PIPELINE_MAX_SECONDS` (default 55) is the orchestrator's own budget. It
+  checks between stages and stops cleanly rather than being killed mid-agent.
+- When it stops it reports `incomplete`, the circular stays `analysing`, and
+  everything finished is already committed.
+- The circular page is polling anyway; when it sees a paused run it calls
+  `continueCircularAction`, which starts the next slice. Up to 12 continues,
+  after which the run is reported as stalled for a human to look at.
+- Resumption points: after intake, after applicability, after obligation
+  extraction, and per rule during drafting. A resumed slice re-reads what is
+  already in the database instead of re-running the agent that produced it.
+
+On a paid plan, raise `maxDuration` and `PIPELINE_MAX_SECONDS` together —
+leaving a few seconds of headroom for the final writes.
+
+### 6. Moving a warm cache
+
+`LLM_MODE=replay` makes the demo immune to API quotas, but it needs a
+populated cache. The cache is a Postgres table, so it moves with a script:
+
+```bash
+# locally, after a real run
+npm run cache:export -- cache.json
+
+# against the deployed database
+DATABASE_URL=... npm run cache:import -- cache.json
+```
+
+Importing never overwrites an existing key.
 
 ---
 

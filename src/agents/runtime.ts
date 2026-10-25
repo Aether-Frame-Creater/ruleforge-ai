@@ -80,6 +80,14 @@ export interface PipelineBudget {
   perAgentTimeoutMs: number;
   /** Attempts per agent call when Gemini returns a transient error. */
   maxRetries: number;
+  /**
+   * Wall-clock budget for one invocation, in milliseconds.
+   *
+   * A serverless function is killed at a hard limit, so the pipeline checks
+   * this between stages and yields instead — returning a resumable result the
+   * caller continues, rather than dying mid-agent with a half-written run.
+   */
+  maxWallClockMs: number;
 }
 
 /**
@@ -92,6 +100,9 @@ export const DEFAULT_BUDGET: PipelineBudget = {
   maxTotalTokens: 400_000,
   perAgentTimeoutMs: 420_000,
   maxRetries: 4,
+  // Generous by default: a CLI run has no function limit. The server action
+  // overrides this from PIPELINE_MAX_SECONDS.
+  maxWallClockMs: 15 * 60_000,
 };
 
 export class BudgetExceededError extends Error {
@@ -167,6 +178,17 @@ export class PipelineContext {
 
   get elapsedMs(): number {
     return Date.now() - this.startedAt;
+  }
+
+  /**
+   * True when the invocation is close enough to its wall-clock budget that
+   * another stage would risk being killed part-way.
+   *
+   * Checked between stages only: interrupting an agent mid-call would leave an
+   * `agent_runs` row stuck in `running`.
+   */
+  shouldYield(): boolean {
+    return this.elapsedMs >= this.budget.maxWallClockMs;
   }
 
   /** Throws before a call is made if it would breach the run's ceilings. */

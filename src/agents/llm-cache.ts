@@ -15,16 +15,23 @@
  *
  * The entry records which model actually answered, which can differ from the
  * model in the key when the quota fallback took over.
+ *
+ * Entries live in the `llm_cache` table rather than on disk: a serverless
+ * deployment has no writable filesystem, and a shared table means a warm cache
+ * is not rebuilt per container.
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 
+import { eq } from "drizzle-orm";
+
+import { llmCache } from "@/db/schema";
+import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 
 export type LlmMode = "cache" | "live" | "record" | "replay";
 
-export const CACHE_DIR = "storage/llm-cache";
+/** Named for the messages that point a developer at the cache. */
+export const CACHE_LOCATION = "the llm_cache table";
 
 /** The mode for this process. */
 export function llmMode(): LlmMode {
@@ -37,7 +44,7 @@ export class ReplayMissError extends Error {
     super(
       `${agent}: no recorded response for this call (cache key ${key.slice(0, 12)}…). ` +
         `LLM_MODE=replay never calls the API. Run once with LLM_MODE=record ` +
-        `(or live) to populate ${CACHE_DIR}, then replay.`,
+        `(or live) to populate ${CACHE_LOCATION}, then replay.`,
     );
     this.name = "ReplayMissError";
   }
@@ -111,25 +118,31 @@ export function cacheKey(input: {
   return hash.digest("hex");
 }
 
-function entryPath(key: string): string {
-  return join(CACHE_DIR, `${key}.json`);
-}
-
 /** Reads a cached entry, or null if nothing was recorded for this key. */
 export async function readCached<T>(key: string): Promise<T | null> {
-  try {
-    return JSON.parse(await readFile(entryPath(key), "utf8")) as T;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
+  const [row] = await db
+    .select({ response: llmCache.response })
+    .from(llmCache)
+    .where(eq(llmCache.cacheKey, key))
+    .limit(1);
+  return (row?.response as T) ?? null;
 }
 
 /** Saves an entry. Writing the cache must never fail a run. */
 export async function writeCached(key: string, value: unknown): Promise<void> {
   try {
-    await mkdir(CACHE_DIR, { recursive: true });
-    await writeFile(entryPath(key), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    const model =
+      (value as { model?: unknown })?.model;
+    await db
+      .insert(llmCache)
+      .values({
+        cacheKey: key,
+        model: typeof model === "string" ? model : "unknown",
+        response: value as never,
+      })
+      // Two concurrent agents can produce the same key; the first write wins
+      // and the second is a no-op rather than an error.
+      .onConflictDoNothing({ target: llmCache.cacheKey });
   } catch (error) {
     console.warn(
       `  ! could not write the response cache: ${

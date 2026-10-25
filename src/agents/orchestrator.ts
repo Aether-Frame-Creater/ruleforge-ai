@@ -14,15 +14,15 @@
  * nowhere in this code path.
  */
 import { desc, eq } from "drizzle-orm";
-import { readFile } from "node:fs/promises";
-
 import {
+  circularChunks,
   circulars,
   obligations as obligationsTable,
   rules,
   ruleVersions,
 } from "@/db/schema";
 import { db } from "@/lib/db";
+import { storage } from "@/lib/storage";
 import { runBacktest } from "@/rules/backtest";
 import { diffRules, explainRule } from "@/rules/engine";
 import type { RuleLogic } from "@/rules/schema";
@@ -168,7 +168,12 @@ export async function runCircularPipeline(
   const progress = options.onProgress ?? (() => {});
 
   const [circular] = await db
-    .select({ id: circulars.id, pdfUrl: circulars.pdfUrl, title: circulars.title })
+    .select({
+      id: circulars.id,
+      pdfUrl: circulars.pdfUrl,
+      title: circulars.title,
+      applicabilityReason: circulars.applicabilityReason,
+    })
     .from(circulars)
     .where(eq(circulars.id, circularId))
     .limit(1);
@@ -197,51 +202,122 @@ export async function runCircularPipeline(
     timings: ctx.timings,
   });
 
+  /**
+   * Stops cleanly at a stage boundary when the invocation is out of time.
+   *
+   * The circular stays `analysing` and everything completed so far is already
+   * in the database, so a `continue` call picks up from here.
+   */
+  const yielded = (where: string): PipelineResult =>
+    finish(
+      "incomplete",
+      `Paused ${where} after ${(ctx.elapsedMs / 1000).toFixed(0)}s to stay inside the invocation limit. Continue to resume.`,
+    );
+
   await setCircularStatus(circularId, "analysing");
 
   /* -- 1. intake ---------------------------------------------------------- */
 
-  progress("intake_agent: reading the PDF");
-  const pdf = await readFile(circular.pdfUrl);
-  const intake = await runIntakeAgent(ctx, {
-    pdf,
-    fileName: circular.pdfUrl,
-  });
-  caseFile.intake = intake;
-  progress(
-    `intake_agent: "${intake.title}" (${intake.paragraphs.length} paragraphs)`,
-  );
+  // Resumption point. If the paragraphs are already stored, intake finished in
+  // an earlier invocation and re-running it would cost a model call, duplicate
+  // every chunk and renumber the obligations' citations.
+  const existingChunks = await db
+    .select({
+      id: circularChunks.id,
+      paragraphRef: circularChunks.paragraphRef,
+      text: circularChunks.text,
+    })
+    .from(circularChunks)
+    .where(eq(circularChunks.circularId, circularId))
+    .orderBy(circularChunks.createdAt);
+
+  let intake: Awaited<ReturnType<typeof runIntakeAgent>>;
+  // Null means "the chunks were already there", which is how later stages
+  // know this invocation resumed rather than started.
+  let stored: { fresh: true } | null = null;
+
+  if (existingChunks.length > 0) {
+    progress(`resuming: ${existingChunks.length} paragraphs already stored`);
+    intake = {
+      title: circular.title,
+      regulator: "other",
+      circularNumber: null,
+      issuedDate: null,
+      paragraphs: existingChunks.map((chunk) => ({
+        paragraphRef: chunk.paragraphRef ?? "",
+        text: chunk.text,
+      })),
+      injectionAttemptNoted: null,
+    };
+    caseFile.intake = intake;
+    caseFile.chunks = existingChunks.map((chunk) => ({
+      chunkId: chunk.id,
+      paragraphRef: chunk.paragraphRef ?? "",
+      text: chunk.text,
+      embedded: true,
+    }));
+  } else {
+    stored = { fresh: true };
+    progress("intake_agent: reading the PDF");
+    // Reads through the storage driver, so the same code path works whether
+    // the PDF is on local disk or in Vercel Blob.
+    const pdf = await storage().get(circular.pdfUrl);
+    intake = await runIntakeAgent(ctx, { pdf, fileName: circular.pdfUrl });
+    caseFile.intake = intake;
+    progress(
+      `intake_agent: "${intake.title}" (${intake.paragraphs.length} paragraphs)`,
+    );
+  }
+
+  if (ctx.shouldYield()) return yielded("after intake");
 
   /* -- 2 and 3. embeddings, metadata and applicability, concurrently ------ */
 
-  // These three touch nothing of each other's: storing paragraphs is a write,
-  // the metadata update is a write to a different table, and the applicability
+  // These touch nothing of each other's: storing paragraphs is a write, the
+  // metadata update is a write to a different table, and the applicability
   // check only reads the intake result already in memory. The paragraphs are
   // stored even if the circular turns out not to apply — the record of what we
   // read is worth keeping either way.
-  progress("embeddings + applicability_agent: running concurrently");
-  const [stored, applicability] = await Promise.all([
-    storeCircularChunks({ circularId, paragraphs: intake.paragraphs }),
-    runApplicabilityAgent(ctx, { intake, concurrent: true }),
-    db
-      .update(circulars)
-      .set({
-        title: intake.title,
-        regulator: intake.regulator,
-        circularNumber: intake.circularNumber,
-        issuedDate: intake.issuedDate,
-      })
-      .where(eq(circulars.id, circularId)),
-  ]);
+  let applicability: Awaited<ReturnType<typeof runApplicabilityAgent>>;
 
-  caseFile.chunks = stored.chunks;
-  progress(
-    `embeddings: ${stored.chunks.length} chunks stored, ${stored.embedded} embedded` +
-      (stored.failed ? `, ${stored.failed} without a vector` : ""),
-  );
+  if (stored === null && circular.applicabilityReason) {
+    // Resumed past this stage: both results are already in the database.
+    progress("resuming: applicability already decided");
+    applicability = {
+      applicable: true,
+      reason: circular.applicabilityReason,
+      confidence: 1,
+    };
+  } else if (stored === null) {
+    // Chunks exist but applicability does not — resume mid-stage.
+    progress("applicability_agent: checking against the bank profile");
+    applicability = await runApplicabilityAgent(ctx, { intake });
+  } else {
+    progress("embeddings + applicability_agent: running concurrently");
+    const [storedNow, applicabilityNow] = await Promise.all([
+      storeCircularChunks({ circularId, paragraphs: intake.paragraphs }),
+      runApplicabilityAgent(ctx, { intake, concurrent: true }),
+      db
+        .update(circulars)
+        .set({
+          title: intake.title,
+          regulator: intake.regulator,
+          circularNumber: intake.circularNumber,
+          issuedDate: intake.issuedDate,
+        })
+        .where(eq(circulars.id, circularId)),
+    ]);
+
+    applicability = applicabilityNow;
+    caseFile.chunks = storedNow.chunks;
+    progress(
+      `embeddings: ${storedNow.chunks.length} chunks stored, ${storedNow.embedded} embedded` +
+        (storedNow.failed ? `, ${storedNow.failed} without a vector` : ""),
+    );
+  }
 
   const chunkByRef = new Map(
-    stored.chunks.map((chunk) => [chunk.paragraphRef, chunk] as const),
+    caseFile.chunks.map((chunk) => [chunk.paragraphRef, chunk] as const),
   );
 
   caseFile.applicability = applicability;
@@ -264,12 +340,54 @@ export async function runCircularPipeline(
 
   /* -- 4. obligations ----------------------------------------------------- */
 
-  progress("obligation_agent: extracting obligations");
-  const extraction = await runObligationAgent(ctx, {
-    paragraphs: intake.paragraphs,
-    title: intake.title,
-  });
-  caseFile.rejectedObligations = extraction.rejected;
+  if (ctx.shouldYield()) return yielded("before obligation extraction");
+
+  // Resumption point: obligations already in the database mean extraction
+  // finished, and re-running it would duplicate every one of them.
+  const priorObligations = await db
+    .select({
+      id: obligationsTable.id,
+      summary: obligationsTable.summary,
+      obligationType: obligationsTable.obligationType,
+      deadline: obligationsTable.deadline,
+      chunkId: obligationsTable.chunkId,
+    })
+    .from(obligationsTable)
+    .where(eq(obligationsTable.circularId, circularId))
+    .orderBy(obligationsTable.createdAt);
+
+  if (priorObligations.length > 0) {
+    progress(`resuming: ${priorObligations.length} obligations already extracted`);
+    const chunkById = new Map(
+      caseFile.chunks.map((chunk) => [chunk.chunkId, chunk] as const),
+    );
+    caseFile.obligations = priorObligations.map((row) => ({
+      obligationId: row.id,
+      chunkId: row.chunkId,
+      summary: row.summary,
+      obligationType: row.obligationType,
+      deadline: row.deadline,
+      paragraphRef: row.chunkId
+        ? (chunkById.get(row.chunkId)?.paragraphRef ?? "")
+        : "",
+      // The verified quote lives on the audit entry; the source paragraph is
+      // enough for the stages that still have to run.
+      quote: row.chunkId ? (chunkById.get(row.chunkId)?.text ?? "") : "",
+    }));
+  }
+
+  const resumedObligations = priorObligations.length > 0;
+
+  const extraction = resumedObligations
+    ? { obligations: [], rejected: [], notes: null }
+    : await (async () => {
+        progress("obligation_agent: extracting obligations");
+        return runObligationAgent(ctx, {
+          paragraphs: intake.paragraphs,
+          title: intake.title,
+        });
+      })();
+  if (!resumedObligations) caseFile.rejectedObligations = extraction.rejected;
 
   for (const dropped of extraction.rejected) {
     progress(`obligation_agent: DROPPED an obligation — ${dropped.reason}`);
@@ -282,7 +400,7 @@ export async function runCircularPipeline(
     });
   }
 
-  if (extraction.obligations.length === 0) {
+  if (!resumedObligations && extraction.obligations.length === 0) {
     const reason =
       "the circular applies, but no obligation survived the quote verification check";
     await setCircularStatus(circularId, "review");
@@ -296,7 +414,9 @@ export async function runCircularPipeline(
     return finish("no_obligations", reason);
   }
 
-  const storedObligations: StoredObligation[] = [];
+  const storedObligations: StoredObligation[] = resumedObligations
+    ? caseFile.obligations
+    : [];
   for (const obligation of extraction.obligations) {
     const chunk = chunkByRef.get(obligation.paragraphRef) ?? null;
     const [row] = await db
@@ -331,9 +451,13 @@ export async function runCircularPipeline(
     });
   }
   caseFile.obligations = storedObligations;
-  progress(
-    `obligation_agent: ${storedObligations.length} verified, ${extraction.rejected.length} dropped`,
-  );
+  if (!resumedObligations) {
+    progress(
+      `obligation_agent: ${storedObligations.length} verified, ${extraction.rejected.length} dropped`,
+    );
+  }
+
+  if (ctx.shouldYield()) return yielded("after obligation extraction");
 
   /* -- 5. mapping --------------------------------------------------------- */
 
@@ -657,11 +781,40 @@ export async function runCircularPipeline(
     return draft;
   }
 
+  // A draft already linked to one of this circular's obligations means that
+  // rule was authored in an earlier invocation.
+  const alreadyDrafted = new Set(
+    (
+      await db
+        .select({ ruleId: ruleVersions.ruleId })
+        .from(ruleVersions)
+        .innerJoin(
+          obligationsTable,
+          eq(obligationsTable.id, ruleVersions.obligationId),
+        )
+        .where(eq(obligationsTable.circularId, circularId))
+    ).map((row) => row.ruleId),
+  );
+
+  const outstanding = prepared.filter(
+    ({ target }) => !alreadyDrafted.has(target.ruleId),
+  );
+
+  if (outstanding.length < prepared.length) {
+    progress(
+      `resuming: ${prepared.length - outstanding.length} rule(s) already drafted`,
+    );
+  }
+
+  if (outstanding.length > 0 && ctx.shouldYield()) {
+    return yielded("before rule drafting");
+  }
+
   // Different rules share nothing: no version counter, no baseline, no agent
   // state. One slow rule no longer holds up the others.
-  const concurrentDrafts = prepared.length > 1;
+  const concurrentDrafts = outstanding.length > 1;
   const results = await Promise.all(
-    prepared.map(({ group, target }) =>
+    outstanding.map(({ group, target }) =>
       draftRule(group, target, concurrentDrafts),
     ),
   );

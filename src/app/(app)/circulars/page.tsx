@@ -18,6 +18,13 @@ import { listCirculars } from "@/lib/queries";
 
 export const instant = false;
 
+/**
+ * Upload starts the pipeline through `after()`, so this route's invocation has
+ * to stay alive while the first slice runs. 60s is the Vercel Hobby ceiling;
+ * a paid plan can raise it, and `PIPELINE_MAX_SECONDS` should move with it.
+ */
+export const maxDuration = 60;
+
 export const metadata = { title: "Circulars — RuleForge AI" };
 
 export default async function CircularsPage() {

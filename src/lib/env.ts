@@ -43,6 +43,20 @@ const envSchema = z.object({
    * Better Auth requires at least 8 characters.
    */
   DEMO_PASSWORD: z.string().min(8).optional(),
+  /**
+   * Where uploaded PDFs go. `local` writes to `storage/`; `blob` uses Vercel
+   * Blob, which is what a deployment needs because Vercel's filesystem is
+   * read-only at runtime.
+   */
+  STORAGE_DRIVER: z.enum(["local", "blob"]).default("local"),
+  /** Required when STORAGE_DRIVER=blob. Vercel injects it for a linked store. */
+  BLOB_READ_WRITE_TOKEN: z.string().optional(),
+  /**
+   * Wall-clock budget for one pipeline invocation, in seconds. Kept under the
+   * platform's function limit so the run yields rather than being killed
+   * mid-agent. Vercel Hobby allows 60.
+   */
+  PIPELINE_MAX_SECONDS: z.coerce.number().int().min(10).max(900).default(55),
 });
 
 const parsed = envSchema.safeParse(process.env);

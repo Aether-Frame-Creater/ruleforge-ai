@@ -2,7 +2,9 @@
   "name": "ruleforge-ai",
   "version": "0.1.0",
   "private": true,
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -15,19 +17,23 @@
     "db:studio": "drizzle-kit studio",
     "db:guards": "node scripts/run-sql.mjs src/db/sql/guards.sql",
     "db:sync": "npm run db:push && npm run db:guards",
-    "db:seed": "tsx --env-file=.env.local src/db/seed.ts",
-    "check:rules": "tsx --env-file=.env.local scripts/check-rules.ts",
+    "db:seed": "tsx --conditions=react-server --env-file=.env.local src/db/seed.ts",
+    "check:rules": "tsx --conditions=react-server --env-file=.env.local scripts/check-rules.ts",
     "auth:generate": "npx @better-auth/cli@latest generate --config src/lib/auth/index.ts --output src/db/auth-schema.ts",
     "demo:circular": "tsx scripts/make-demo-circular.ts",
-    "agents:run": "tsx --env-file=.env.local scripts/run-pipeline.ts",
-    "demo:reset": "tsx --env-file=.env.local scripts/demo-reset.ts",
-    "check:deploy": "tsx --conditions=react-server --env-file=.env.local scripts/check-deploy.ts"
+    "agents:run": "tsx --conditions=react-server --env-file=.env.local scripts/run-pipeline.ts",
+    "demo:reset": "tsx --conditions=react-server --env-file=.env.local scripts/demo-reset.ts",
+    "check:deploy": "tsx --conditions=react-server --env-file=.env.local scripts/check-deploy.ts",
+    "cache:export": "tsx --conditions=react-server --env-file=.env.local scripts/llm-cache.ts export",
+    "cache:import": "tsx --conditions=react-server --env-file=.env.local scripts/llm-cache.ts import",
+    "db:deploy": "tsx --env-file=.env.local scripts/db-deploy.ts"
   },
   "dependencies": {
     "@faker-js/faker": "^10.6.0",
     "@google/adk": "^2.3.0",
     "@google/genai": "^2.31.0",
     "@neondatabase/serverless": "^1.2.0",
+    "@vercel/blob": "^2.8.2",
     "better-auth": "^1.7.12",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.5.0",

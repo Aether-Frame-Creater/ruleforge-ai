@@ -409,6 +409,24 @@ export const agentRuns = pgTable("agent_runs", {
 });
 
 /**
+ * Recorded model responses, keyed by a hash of the request.
+ *
+ * In the database rather than on disk because a serverless deployment has no
+ * writable filesystem, and because a warm cache is then shared by every
+ * instance instead of being rebuilt per container.
+ */
+export const llmCache = pgTable("llm_cache", {
+  /** SHA-256 over model, system instruction and every prompt part. */
+  cacheKey: text("cache_key").primaryKey(),
+  /** The model requested — the entry records separately which one answered. */
+  model: text("model").notNull(),
+  response: jsonb("response").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+/**
  * Append-only audit trail. `actor` is a user id or an agent name, so it is not
  * a foreign key. INSERT-only is enforced by a trigger in `src/db/sql/guards.sql`.
  */
@@ -608,6 +626,9 @@ export type NewApproval = typeof approvals.$inferInsert;
 
 export type AgentRun = typeof agentRuns.$inferSelect;
 export type NewAgentRun = typeof agentRuns.$inferInsert;
+
+export type LlmCacheEntry = typeof llmCache.$inferSelect;
+export type NewLlmCacheEntry = typeof llmCache.$inferInsert;
 
 export type AuditLogEntry = typeof auditLog.$inferSelect;
 export type NewAuditLogEntry = typeof auditLog.$inferInsert;

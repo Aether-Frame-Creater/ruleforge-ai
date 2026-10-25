@@ -8,21 +8,20 @@
  * Nothing it produces is approved: every rule version comes out as a draft.
  */
 import { existsSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
-import { basename, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 
 import { LogLevel, setLogLevel } from "@google/adk";
 import { eq } from "drizzle-orm";
 
-import { llmMode, CACHE_DIR } from "@/agents/llm-cache";
+import { llmMode, CACHE_LOCATION } from "@/agents/llm-cache";
 import { runCircularPipeline } from "@/agents/orchestrator";
 import { audit } from "@/agents/runtime";
+import { circularKey, storage } from "@/lib/storage";
 import { GEMINI_MODEL, GEMINI_MODEL_FALLBACK, GEMINI_MODEL_LITE } from "@/lib/ai/gemini";
 import { circulars, user } from "@/db/schema";
 import { db } from "@/lib/db";
 
-const STORAGE_DIR = "storage/circulars";
 const UPLOADER_EMAIL = "officer@ruleforge.demo";
 
 function rule(title: string) {
@@ -34,9 +33,9 @@ function section(title: string) {
 }
 
 const MODE_NOTES: Record<ReturnType<typeof llmMode>, string> = {
-  cache: `  (read-through: uses ${CACHE_DIR} when it can, else calls and saves)`,
-  live: `  (always calls the API, then saves to ${CACHE_DIR})`,
-  record: `  (always calls the API, saving responses to ${CACHE_DIR})`,
+  cache: `  (read-through: uses ${CACHE_LOCATION} when it can, else calls and saves)`,
+  live: `  (always calls the API, then saves to ${CACHE_LOCATION})`,
+  record: `  (always calls the API, saving responses to ${CACHE_LOCATION})`,
   replay: "  (serves saved responses only; no API calls)",
 };
 
@@ -86,11 +85,13 @@ async function main() {
     );
   }
 
-  // Store the PDF under a generated name so two uploads of the same file do
-  // not collide, and so the stored copy is immutable evidence of what was read.
-  await mkdir(STORAGE_DIR, { recursive: true });
-  const storedPath = join(STORAGE_DIR, `${randomUUID()}-${basename(source)}`);
-  await copyFile(source, storedPath);
+  // Store the PDF under a generated key so two uploads of the same file do not
+  // collide, and so the stored copy is immutable evidence of what was read.
+  const stored = await storage().put(
+    circularKey(basename(source)),
+    await readFile(source),
+    "application/pdf",
+  );
 
   const [circular] = await db
     .insert(circulars)
@@ -98,7 +99,7 @@ async function main() {
       // Placeholders; the intake agent replaces them from the document itself.
       title: basename(source),
       regulator: "other",
-      pdfUrl: storedPath,
+      pdfUrl: stored.key,
       status: "uploaded",
       uploadedBy: uploader.id,
     })
@@ -109,12 +110,12 @@ async function main() {
     action: "circular.uploaded",
     entityType: "circulars",
     entityId: circular.id,
-    details: { source, stored_path: storedPath },
+    details: { source, storage_driver: storage().driver, storage_key: stored.key },
   });
 
   rule("RuleForge AI — circular pipeline");
   console.log(`  source:      ${source}`);
-  console.log(`  stored as:   ${storedPath}`);
+  console.log(`  stored as:   ${stored.key} (${storage().driver})`);
   console.log(`  circular id: ${circular.id}`);
   console.log(`  uploaded by: ${uploader.email}`);
   console.log(`  LLM_MODE:    ${mode}${MODE_NOTES[mode]}`);
