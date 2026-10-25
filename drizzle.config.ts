@@ -1,14 +1,16 @@
-import "dotenv/config";
+import { config } from "dotenv";
 import { defineConfig } from "drizzle-kit";
 
+config({ path: ".env.local" });
+
+const url = process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL;
+if (!url) {
+  throw new Error("DATABASE_URL_UNPOOLED is missing in .env.local");
+}
+
 export default defineConfig({
-  dialect: "postgresql",
   schema: "./src/db/schema.ts",
-  out: "./src/db/migrations",
-  dbCredentials: {
-    // Migrations run over the direct (non-pooled) Neon connection.
-    url: process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL!,
-  },
-  verbose: true,
-  strict: true,
+  out: "./drizzle",
+  dialect: "postgresql",
+  dbCredentials: { url },
 });
