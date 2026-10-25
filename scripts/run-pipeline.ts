@@ -1,0 +1,239 @@
+/**
+ * Runs the circular pipeline over a PDF from the command line.
+ *
+ *   npm run agents:run -- samples/circulars/demo-aml-cash-threshold.pdf
+ *
+ * Creates a `circulars` row attributed to officer@ruleforge.demo, copies the PDF
+ * into storage/circulars/, runs the pipeline, and prints the full case file.
+ * Nothing it produces is approved: every rule version comes out as a draft.
+ */
+import { copyFile, mkdir } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
+
+import { LogLevel, setLogLevel } from "@google/adk";
+import { eq } from "drizzle-orm";
+
+import { runCircularPipeline } from "@/agents/orchestrator";
+import { audit } from "@/agents/runtime";
+import { circulars, user } from "@/db/schema";
+import { db } from "@/lib/db";
+
+const DEFAULT_PDF = "samples/circulars/demo-aml-cash-threshold.pdf";
+const STORAGE_DIR = "storage/circulars";
+const UPLOADER_EMAIL = "officer@ruleforge.demo";
+
+function rule(title: string) {
+  console.log(`\n${"=".repeat(72)}\n${title}\n${"=".repeat(72)}`);
+}
+
+function section(title: string) {
+  console.log(`\n--- ${title} ${"-".repeat(Math.max(0, 66 - title.length))}`);
+}
+
+function money(value: number): string {
+  return value.toLocaleString("en-US");
+}
+
+async function main() {
+  // ADK logs every request at INFO; the pipeline prints its own progress.
+  setLogLevel(LogLevel.WARN);
+
+  const source = process.argv[2] ?? DEFAULT_PDF;
+  const startedAt = Date.now();
+
+  const [uploader] = await db
+    .select({ id: user.id, email: user.email })
+    .from(user)
+    .where(eq(user.email, UPLOADER_EMAIL))
+    .limit(1);
+
+  if (!uploader) {
+    throw new Error(
+      `${UPLOADER_EMAIL} does not exist. Run \`npm run db:seed\` first.`,
+    );
+  }
+
+  // Store the PDF under a generated name so two uploads of the same file do
+  // not collide, and so the stored copy is immutable evidence of what was read.
+  await mkdir(STORAGE_DIR, { recursive: true });
+  const storedPath = join(STORAGE_DIR, `${randomUUID()}-${basename(source)}`);
+  await copyFile(source, storedPath);
+
+  const [circular] = await db
+    .insert(circulars)
+    .values({
+      // Placeholders; the intake agent replaces them from the document itself.
+      title: basename(source),
+      regulator: "other",
+      pdfUrl: storedPath,
+      status: "uploaded",
+      uploadedBy: uploader.id,
+    })
+    .returning({ id: circulars.id });
+
+  await audit({
+    actor: `user:${uploader.email}`,
+    action: "circular.uploaded",
+    entityType: "circulars",
+    entityId: circular.id,
+    details: { source, stored_path: storedPath },
+  });
+
+  rule("RuleForge AI — circular pipeline");
+  console.log(`  source:      ${source}`);
+  console.log(`  stored as:   ${storedPath}`);
+  console.log(`  circular id: ${circular.id}`);
+  console.log(`  uploaded by: ${uploader.email}`);
+
+  section("pipeline");
+  const result = await runCircularPipeline(circular.id, {
+    onProgress: (message) => console.log(`  ${message}`),
+  });
+
+  const { caseFile } = result;
+
+  /* -- applicability ------------------------------------------------------ */
+
+  section("applicability");
+  if (caseFile.applicability) {
+    console.log(`  applicable:  ${caseFile.applicability.applicable}`);
+    console.log(`  confidence:  ${caseFile.applicability.confidence}`);
+    console.log(`  reason:      ${caseFile.applicability.reason}`);
+  } else {
+    console.log("  (not reached)");
+  }
+
+  /* -- intake ------------------------------------------------------------- */
+
+  if (caseFile.intake) {
+    section("circular as read");
+    console.log(`  title:       ${caseFile.intake.title}`);
+    console.log(`  regulator:   ${caseFile.intake.regulator}`);
+    console.log(`  number:      ${caseFile.intake.circularNumber ?? "(none)"}`);
+    console.log(`  issued:      ${caseFile.intake.issuedDate ?? "(none)"}`);
+    console.log(`  paragraphs:  ${caseFile.intake.paragraphs.length}`);
+    console.log(
+      `  chunks:      ${caseFile.chunks.length} stored, ${caseFile.chunks.filter((c) => c.embedded).length} embedded`,
+    );
+    if (caseFile.intake.injectionAttemptNoted) {
+      console.log(
+        `  ! injection attempt noted: ${caseFile.intake.injectionAttemptNoted}`,
+      );
+    }
+  }
+
+  /* -- obligations -------------------------------------------------------- */
+
+  section("obligations");
+  if (caseFile.obligations.length === 0) {
+    console.log("  (none verified)");
+  }
+  for (const obligation of caseFile.obligations) {
+    console.log(`  [${obligation.paragraphRef}] ${obligation.summary}`);
+    console.log(`      type:     ${obligation.obligationType}`);
+    console.log(`      deadline: ${obligation.deadline ?? "(none stated)"}`);
+    console.log(`      chunk:    ${obligation.chunkId ?? "(unlinked)"}`);
+    console.log(`      quote:    "${obligation.quote}"`);
+  }
+  if (caseFile.rejectedObligations.length > 0) {
+    console.log(
+      `\n  dropped by the quote check: ${caseFile.rejectedObligations.length}`,
+    );
+    for (const dropped of caseFile.rejectedObligations) {
+      console.log(`      - ${dropped.reason}`);
+    }
+  }
+
+  /* -- mapping ------------------------------------------------------------ */
+
+  section("mapping");
+  for (const mapping of caseFile.mappings) {
+    console.log(
+      `  [${mapping.paragraphRef}] ${mapping.decision}${mapping.ruleCode ? ` -> ${mapping.ruleCode}` : ""}`,
+    );
+    console.log(`      ${mapping.rationale}`);
+  }
+
+  /* -- drafts ------------------------------------------------------------- */
+
+  section("draft rule versions");
+  if (caseFile.drafts.length === 0) {
+    console.log("  (none)");
+  }
+  for (const draft of caseFile.drafts) {
+    console.log(`\n  ${draft.ruleCode} v${draft.version}  [status: draft]`);
+    console.log(`      version id:  ${draft.ruleVersionId}`);
+    console.log(`      obligation:  ${draft.obligationId}`);
+    console.log(`      authored in: ${draft.attempts} attempt(s)`);
+    console.log(`      behaviour:   ${draft.explanation}`);
+    console.log(`      json_logic:  ${JSON.stringify(draft.jsonLogic)}`);
+    console.log("      diff vs the version in force:");
+    for (const line of draft.diff) console.log(`        - ${line}`);
+
+    if (draft.backtest) {
+      const bt = draft.backtest;
+      console.log("      backtest:");
+      console.log(`        transactions:        ${money(bt.total_txns)}`);
+      console.log(`        alerts before:       ${money(bt.old_alerts)}`);
+      console.log(`        alerts after:        ${money(bt.new_alerts)}`);
+      console.log(`        added / removed:     +${bt.alerts_added} / -${bt.alerts_removed}`);
+      console.log(`        customers affected:  ${money(bt.customers_affected)}`);
+      console.log(`        run id:              ${bt.backtest_run_id}`);
+    }
+
+    if (draft.impact) {
+      console.log(`      impact (risk: ${draft.impact.risk_level}):`);
+      console.log(`        ${draft.impact.summary}`);
+      for (const driver of draft.impact.drivers) {
+        console.log(`        - ${driver}`);
+      }
+    }
+
+    if (draft.challenger) {
+      console.log(
+        `      challenger: ${draft.challenger.verdict} (severity ${draft.challenger.severity})`,
+      );
+      for (const reason of draft.challenger.reasons) {
+        console.log(`        - ${reason}`);
+      }
+    }
+
+    if (draft.needsHumanAttention) {
+      console.log(`      ** FLAGGED FOR HUMAN ATTENTION: ${draft.attentionReason}`);
+    }
+  }
+
+  /* -- envelopes and cost -------------------------------------------------- */
+
+  section("A2A envelopes");
+  console.log(`  ${caseFile.envelopes.length} exchanged (all persisted in agent_runs)`);
+  for (const env of caseFile.envelopes) {
+    console.log(`    ${env.timestamp}  ${env.from} -> ${env.to}  [${env.type}]`);
+  }
+
+  section("usage");
+  console.log(`  LLM calls:        ${result.stats.llmCalls}`);
+  console.log(`  prompt tokens:    ${money(result.stats.promptTokens)}`);
+  console.log(`  candidate tokens: ${money(result.stats.candidateTokens)}`);
+  console.log(`  total tokens:     ${money(result.stats.totalTokens)}`);
+  console.log(
+    `  pipeline time:    ${(result.stats.elapsedMs / 1000).toFixed(1)}s`,
+  );
+  console.log(`  wall clock:       ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+
+  rule(`OUTCOME: ${result.outcome}`);
+  console.log(`  ${result.reason}`);
+  console.log(
+    "\n  No rule version was approved, shadowed or activated by any agent.",
+  );
+  console.log("  Every draft above is waiting on a human maker-checker decision.");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error("\npipeline run failed:");
+    console.error(error);
+    process.exit(1);
+  });

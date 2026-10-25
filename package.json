@@ -16,7 +16,9 @@
     "db:sync": "npm run db:push && npm run db:guards",
     "db:seed": "tsx --env-file=.env.local src/db/seed.ts",
     "check:rules": "tsx --env-file=.env.local scripts/check-rules.ts",
-    "auth:generate": "npx @better-auth/cli@latest generate --config src/lib/auth/index.ts --output src/db/auth-schema.ts"
+    "auth:generate": "npx @better-auth/cli@latest generate --config src/lib/auth/index.ts --output src/db/auth-schema.ts",
+    "demo:circular": "tsx scripts/make-demo-circular.ts",
+    "agents:run": "tsx --env-file=.env.local scripts/run-pipeline.ts"
   },
   "dependencies": {
     "@faker-js/faker": "^10.6.0",
@@ -47,6 +49,7 @@
     "drizzle-kit": "^0.31.11",
     "eslint": "^9",
     "eslint-config-next": "16.4.3",
+    "pdf-lib": "^1.17.1",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "typescript": "^5"

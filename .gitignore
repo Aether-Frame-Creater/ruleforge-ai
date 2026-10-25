@@ -42,3 +42,6 @@ next-env.d.ts
 
 # keep the template committed
 !.env.example
+
+# uploaded circular PDFs
+/storage
